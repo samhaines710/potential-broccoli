@@ -1,9 +1,13 @@
-"""Configuration constants for the trading system.
+"""Configuration constants for the trading system (institutional edition).
 
-This module centralizes environment-driven settings, default values,
-and constants used throughout the application. It avoids repeated
-lookups and ensures consistent configuration handling.
+Key upgrades:
+- Removed NIO; added BABA and VEX.
+- Lower default exploration epsilon to 0.02 (env override BANDIT_EPSILON).
+- New MODEL_URI default for institutional pipeline.
+- Expose HIST_DAYS/LOOKBACK_BARS/LOOKAHEAD_BARS via env.
 """
+
+from __future__ import annotations
 
 import os
 import pytz
@@ -46,11 +50,8 @@ DIVIDEND_YIELDS = {
     "VEX": 0.00,
 }
 
-# === Single Fallback Volatility ===
-# Used only if realized sigma cannot be computed
-DEFAULT_VOLATILITY_FALLBACK = float(
-    os.getenv("DEFAULT_VOLATILITY_FALLBACK", "0.2")
-)
+# === Single Fallback Volatility (if realized sigma unavailable)
+DEFAULT_VOLATILITY_FALLBACK = float(os.getenv("DEFAULT_VOLATILITY_FALLBACK", "0.2"))
 
 # === Timezone & Market-Hour Labels ===
 tz = pytz.timezone("US/Eastern")
@@ -95,10 +96,10 @@ DATA_SOURCE_MODE = "hybrid"
 REST_POLL_INTERVAL = 10
 WEBHOOK_INITIAL_DELAY = 300
 
-# === Historical Lookbacks ===
-LOOKBACK_BREAKOUT = 5
-LOOKBACK_RISK_REWARD = 20
-DEFAULT_CANDLE_LIMIT = 500
+# === Historical Lookbacks (env overridable)
+HIST_DAYS = int(os.getenv("HIST_DAYS", "90"))
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "18"))
+LOOKAHEAD_BARS = int(os.getenv("LOOKAHEAD_BARS", "3"))
 
 # === TTL (Time-to-Live) Mappings ===
 TTL_MAP = {
@@ -108,5 +109,11 @@ TTL_MAP = {
 }
 
 # === Exit-Level Parameters ===
-EXIT_PROFIT_TARGET = 0.06
-EXIT_STOP_LOSS = -0.035
+EXIT_PROFIT_TARGET = 0.02
+EXIT_STOP_LOSS = -0.015
+
+# === Model path (institutional model)
+MODEL_URI = os.getenv(
+    "MODEL_URI",
+    "s3://grond-inst-prod-models-us-east-1/models/xgb_classifier_inst.pipeline.joblib",
+)
