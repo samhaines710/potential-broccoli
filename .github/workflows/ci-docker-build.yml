@@ -28,14 +28,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/Grond-main 2/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt flake8 pytest python-dotenv
+          pip install -r "Grond-main 2/requirements.txt" flake8 pytest python-dotenv
 
       - name: Lint (flake8)
         run: flake8 . --max-line-length=88
@@ -86,4 +86,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Do NOT pass secrets at build time. The container reads runtime envs.
