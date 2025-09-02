@@ -12,6 +12,11 @@ jobs:
     name: Train & Upload to S3
     runs-on: ubuntu-latest
     environment: CI
+    env:
+      # Make project package-resolvable (space-safe by quoting)
+      PYTHONPATH: "${{ github.workspace }}/Grond-main 2"
+      AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+      ML_MODEL_PATH: ${{ vars.ML_MODEL_PATH }}
 
     steps:
       - name: Checkout
@@ -26,7 +31,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('Grond-main 2/requirements.txt') }}
+          key: "${{ runner.os }}-pip-${{ hashFiles('Grond-main 2/requirements.txt') }}"
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -36,8 +41,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt boto3
 
-      # --- CRITICAL FIXES FOR IMPORT PATHS ---
-      - name: Make local utils a proper package
+      - name: Ensure local utils is a package
         working-directory: "Grond-main 2"
         run: |
           python - <<'PY'
@@ -45,17 +49,8 @@ import pathlib
 p = pathlib.Path("utils/__init__.py")
 p.parent.mkdir(parents=True, exist_ok=True)
 if not p.exists():
-    p.write_text("# marker to make 'utils' a package\n")
-print("utils package ok at:", p.resolve())
-PY
-
-      - name: Export PYTHONPATH to include project root
-        run: |
-          echo "PYTHONPATH=${GITHUB_WORKSPACE}/Grond-main 2" >> $GITHUB_ENV
-          python - <<'PY'
-import os, sys
-print("PYTHONPATH:", os.environ.get("PYTHONPATH"))
-print("sys.path[0:3]:", sys.path[0:3])
+    p.write_text("# make utils a package\n")
+print("utils package at:", p.resolve())
 PY
 
       - name: Prepare training data
@@ -72,7 +67,7 @@ PY
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ vars.AWS_DEFAULT_REGION }}
+          aws-region:            ${{ env.AWS_DEFAULT_REGION }}
 
       - name: Install AWS CLI
         run: |
@@ -84,20 +79,22 @@ PY
         shell: bash
         run: |
           set -euo pipefail
-          uri="${{ vars.ML_MODEL_PATH }}"
+          uri="${ML_MODEL_PATH}"
           if [[ "$uri" != s3://* ]]; then
             echo "ML_MODEL_PATH must be an s3:// URI; got: $uri" >&2
             exit 1
           fi
           bucket="${uri#s3://}"; bucket="${bucket%%/*}"
-          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
-          echo "model_uri=$uri" >> "$GITHUB_OUTPUT"
-          echo "csv_uri=s3://$bucket/data/movement_training_data.csv" >> "$GITHUB_OUTPUT"
+          {
+            echo "bucket=$bucket"
+            echo "model_uri=$uri"
+            echo "csv_uri=s3://$bucket/data/movement_training_data.csv"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload training CSV to S3
         working-directory: "Grond-main 2"
         run: |
-          aws s3 cp data/movement_training_data.csv '${{ steps.s3vars.outputs.csv_uri }}' --only-show-errors
+          aws s3 cp data/movement_training_data.csv "${{ steps.s3vars.outputs.csv_uri }}" --only-show-errors
 
       - name: Train model pipeline
         working-directory: "Grond-main 2"
@@ -113,7 +110,7 @@ PY
       - name: Upload model artifact to S3
         working-directory: "Grond-main 2"
         run: |
-          aws s3 cp models/xgb_classifier.pipeline.joblib '${{ steps.s3vars.outputs.model_uri }}' --only-show-errors
+          aws s3 cp models/xgb_classifier.pipeline.joblib "${{ steps.s3vars.outputs.model_uri }}" --only-show-errors
 
       - name: Upload artifacts to GitHub
         uses: actions/upload-artifact@v4
