@@ -275,7 +275,7 @@ def compute_l1_metrics(*args: Any,
     is_crossed = (a < b).astype(int)
 
     if as_frame:
-        # Return as Series aligned to the longest input
+        # Return as Series/DataFrame aligned to the longest input
         idx = None
         for src in (bid, ask, bid_size, ask_size):
             if isinstance(src, pd.Series):
