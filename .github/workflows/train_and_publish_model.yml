@@ -12,11 +12,6 @@ jobs:
     name: Train & Upload to S3
     runs-on: ubuntu-latest
     environment: CI
-    env:
-      # Make project package-resolvable (space-safe by quoting)
-      PYTHONPATH: "${{ github.workspace }}/Grond-main 2"
-      AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
-      ML_MODEL_PATH: ${{ vars.ML_MODEL_PATH }}
 
     steps:
       - name: Checkout
@@ -31,30 +26,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: "${{ runner.os }}-pip-${{ hashFiles('Grond-main 2/requirements.txt') }}"
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
       - name: Install dependencies
-        working-directory: "Grond-main 2"
+        working-directory: Grond-main 2
         run: |
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt boto3
 
       - name: Ensure local utils is a package
-        working-directory: "Grond-main 2"
+        working-directory: Grond-main 2
         run: |
-          python - <<'PY'
-import pathlib
-p = pathlib.Path("utils/__init__.py")
-p.parent.mkdir(parents=True, exist_ok=True)
-if not p.exists():
-    p.write_text("# make utils a package\n")
-print("utils package at:", p.resolve())
-PY
+          python -c "import pathlib; p=pathlib.Path('utils/__init__.py'); p.parent.mkdir(parents=True, exist_ok=True); (p.exists() or p.write_text('# package'))"
 
       - name: Prepare training data
-        working-directory: "Grond-main 2"
+        working-directory: Grond-main 2
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: |
@@ -65,9 +53,9 @@ PY
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_DEFAULT_REGION }}
+          aws-region: ${{ vars.AWS_DEFAULT_REGION }}
 
       - name: Install AWS CLI
         run: |
@@ -77,38 +65,38 @@ PY
       - name: Derive S3 URIs
         id: s3vars
         shell: bash
+        env:
+          ML_MODEL_PATH: ${{ vars.ML_MODEL_PATH }}
         run: |
           set -euo pipefail
-          uri="${ML_MODEL_PATH}"
+          uri="$ML_MODEL_PATH"
           if [[ "$uri" != s3://* ]]; then
             echo "ML_MODEL_PATH must be an s3:// URI; got: $uri" >&2
             exit 1
           fi
           bucket="${uri#s3://}"; bucket="${bucket%%/*}"
-          {
-            echo "bucket=$bucket"
-            echo "model_uri=$uri"
-            echo "csv_uri=s3://$bucket/data/movement_training_data.csv"
-          } >> "$GITHUB_OUTPUT"
+          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+          echo "model_uri=$uri" >> "$GITHUB_OUTPUT"
+          echo "csv_uri=s3://$bucket/data/movement_training_data.csv" >> "$GITHUB_OUTPUT"
 
       - name: Upload training CSV to S3
-        working-directory: "Grond-main 2"
+        working-directory: Grond-main 2
         run: |
           aws s3 cp data/movement_training_data.csv "${{ steps.s3vars.outputs.csv_uri }}" --only-show-errors
 
       - name: Train model pipeline
-        working-directory: "Grond-main 2"
+        working-directory: Grond-main 2
         run: |
           mkdir -p models
           python train_ml_classifier.py \
-            --train-csv   data/movement_training_data.csv \
-            --label-col   movement_type \
-            --model-dir   models \
+            --train-csv data/movement_training_data.csv \
+            --label-col movement_type \
+            --model-dir models \
             --model-filename xgb_classifier.pipeline.joblib
           test -s models/xgb_classifier.pipeline.joblib
 
       - name: Upload model artifact to S3
-        working-directory: "Grond-main 2"
+        working-directory: Grond-main 2
         run: |
           aws s3 cp models/xgb_classifier.pipeline.joblib "${{ steps.s3vars.outputs.model_uri }}" --only-show-errors
 
