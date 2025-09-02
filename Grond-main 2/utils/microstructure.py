@@ -4,33 +4,37 @@
 """
 Institutional microstructure utilities.
 
-Exposes:
+Exports
+-------
 - calc_spread(bid, ask)
 - midprice(bid, ask)
 - micro_price(bid, ask, bid_size, ask_size)
 - imbalance(bid_size, ask_size)
 - add_l1_features(df, bid_col="bid", ask_col="ask", bid_size_col="bid_size", ask_size_col="ask_size",
                   prefix=None, price_scale=1.0)
-- compute_l1_metrics(...)
-- compute_ofi(...)            <-- added (Cont-style OFI over L1 quotes)
+- compute_l1_metrics(df=..., or bid/ask/bid_size/ask_size=..., as_frame=...)
+- compute_ofi(df=..., method="cont"| "diff", normalize=False, window=None, as_frame=True)
+- compute_trade_signed_volume(df=..., trades + (optional) quotes in same frame, or price/volume arrays,
+                              method="lee_ready"|"tick", normalize=False, window=None, as_frame=True)
 
-Design:
-- Vectorized; safe for scalars, numpy arrays, or pandas Series/DataFrames.
-- Explicit NaN handling.
+Design notes
+------------
+- Vectorized; safe for scalars/ndarrays/Series/DataFrames.
+- Preserves DataFrame index when possible.
+- No reliance on Pandas nullable dtypes (uses np.int8).
 """
 
 from __future__ import annotations
-from typing import Union, Optional, Dict, Any
+from typing import Union, Optional, Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
 
-# If you already have utils/micro_features.py, reuse it when possible.
+# If your repo already has utils/micro_features.py, delegate to it when possible.
 _HAS_MF = False
 _HAS_MF_COMPUTE = False
 try:
-    # type: ignore[attr-defined]
-    from .micro_features import (  # noqa
+    from .micro_features import (  # type: ignore
         calc_spread as _mf_calc_spread,
         midprice as _mf_midprice,
         micro_price as _mf_micro_price,
@@ -39,7 +43,6 @@ try:
     )
     _HAS_MF = True
     try:
-        # optional in some trees
         from .micro_features import compute_l1_metrics as _mf_compute_l1_metrics  # type: ignore
         _HAS_MF_COMPUTE = True
     except Exception:
@@ -150,7 +153,6 @@ def add_l1_features(df: pd.DataFrame,
     price_scale: multiply prices before bps calc (use 0.01 if quotes are in cents).
     """
     if _HAS_MF:
-        # If your existing function doesn't support price_scale/prefix, fall back to ours.
         try:
             return _mf_add_l1_features(df, bid_col, ask_col, bid_size_col, ask_size_col, prefix)
         except TypeError:
@@ -179,8 +181,9 @@ def add_l1_features(df: pd.DataFrame,
     with np.errstate(invalid="ignore", divide="ignore"):
         out[f"{prefix}spread_bps"] = (out[f"{prefix}spread"] / out[f"{prefix}mid"]) * 1e4
 
-    out[f"{prefix}is_locked"] = (ask == bid).astype("Int8")
-    out[f"{prefix}is_crossed"] = (ask < bid).astype("Int8")
+    # robust flags (no pandas nullable int)
+    out[f"{prefix}is_locked"] = (ask == bid).astype(np.int8)
+    out[f"{prefix}is_crossed"] = (ask < bid).astype(np.int8)
     return out
 
 
@@ -202,62 +205,27 @@ def compute_l1_metrics(*args: Any,
                        price_scale: float = 1.0,
                        as_frame: bool = True) -> Union[pd.DataFrame, Dict[str, Any], pd.Series]:
     """
-    Flexible interface:
-
-    1) DataFrame mode (recommended):
-       compute_l1_metrics(df=<quotes_df>, bid_col="bid", ask_col="ask",
-                          bid_size_col="bid_size", ask_size_col="ask_size",
-                          prefix=None, price_scale=1.0, as_frame=True)
-       -> returns DataFrame with added columns
-
-    2) Vector/scalar mode:
-       compute_l1_metrics(bid=<...>, ask=<...>, bid_size=<...>, ask_size=<...>, as_frame=False)
-       -> returns dict with spread, mid, microprice, imbalance, spread_bps, is_locked, is_crossed
-
-    Also supports legacy call pattern where the first positional arg is a DataFrame.
+    Either pass a DataFrame (preferred) or pass separate arrays/Series.
     """
-    # Prefer an existing implementation if provided downstream
     if _HAS_MF_COMPUTE:
         try:
             return _mf_compute_l1_metrics(
                 df=df if df is not None else (args[0] if (len(args) >= 1 and isinstance(args[0], pd.DataFrame)) else None),
-                bid=bid,
-                ask=ask,
-                bid_size=bid_size,
-                ask_size=ask_size,
-                bid_col=bid_col,
-                ask_col=ask_col,
-                bid_size_col=bid_size_col,
-                ask_size_col=ask_size_col,
-                prefix=prefix,
-                price_scale=price_scale,
-                as_frame=as_frame,
+                bid=bid, ask=ask, bid_size=bid_size, ask_size=ask_size,
+                bid_col=bid_col, ask_col=ask_col, bid_size_col=bid_size_col, ask_size_col=ask_size_col,
+                prefix=prefix, price_scale=price_scale, as_frame=as_frame,
             )
         except TypeError:
-            # Signature mismatch—fall back to our robust version
             pass
 
-    # Detect legacy positional DF usage
     if df is None and len(args) >= 1 and isinstance(args[0], pd.DataFrame):
         df = args[0]
 
     if df is not None:
-        # DataFrame mode
-        return add_l1_features(
-            df=df,
-            bid_col=bid_col,
-            ask_col=ask_col,
-            bid_size_col=bid_size_col,
-            ask_size_col=ask_size_col,
-            prefix=prefix,
-            price_scale=price_scale,
-        )
+        return add_l1_features(df, bid_col, ask_col, bid_size_col, ask_size_col, prefix, price_scale)
 
-    # Vector/scalar mode
     if bid is None or ask is None or bid_size is None or ask_size is None:
-        raise ValueError(
-            "compute_l1_metrics requires either df=... or bid/ask/bid_size/ask_size inputs."
-        )
+        raise ValueError("compute_l1_metrics requires either df=... or bid/ask/bid_size/ask_size.")
 
     b = _to_array(bid).astype(float) * price_scale
     a = _to_array(ask).astype(float) * price_scale
@@ -272,17 +240,16 @@ def compute_l1_metrics(*args: Any,
     with np.errstate(invalid="ignore", divide="ignore"):
         spread_bps = (spread / mid) * 1e4
 
-    is_locked = (a == b).astype(int)
-    is_crossed = (a < b).astype(int)
+    is_locked = (a == b).astype(np.int8)
+    is_crossed = (a < b).astype(np.int8)
 
     if as_frame:
-        # Return as Series/DataFrame aligned to the longest input
         idx = None
         for src in (bid, ask, bid_size, ask_size):
             if isinstance(src, pd.Series):
                 idx = src.index
                 break
-        out_df = pd.DataFrame(
+        return pd.DataFrame(
             {
                 "spread": spread,
                 "mid": mid,
@@ -294,7 +261,6 @@ def compute_l1_metrics(*args: Any,
             },
             index=idx,
         )
-        return out_df
 
     return {
         "spread": _return_like(spread, b, a),
@@ -308,7 +274,7 @@ def compute_l1_metrics(*args: Any,
 
 
 # ----------------------------
-# Order Flow Imbalance (OFI)
+# Order Flow Imbalance (OFI): Cont/Kukanov/Stoikov L1 approximation
 # ----------------------------
 
 def compute_ofi(*args: Any,
@@ -321,34 +287,16 @@ def compute_ofi(*args: Any,
                 normalize: bool = False,
                 window: Optional[int] = None,
                 as_frame: bool = True) -> Union[pd.Series, pd.DataFrame]:
-    """
-    Compute Order Flow Imbalance (OFI) from L1 quotes.
-
-    Default 'cont' method (Cont, Kukanov & Stoikov 2011, L1 approximation):
-        ofi_t = 1_{Δbid>0} * bid_size_t   - 1_{Δbid<0} * bid_size_{t-1}
-              + 1_{Δask<0} * ask_size_{t-1} - 1_{Δask>0} * ask_size_t
-
-    Notes
-    -----
-    - Uses previous tick sizes where required.
-    - If `normalize=True`, divides by (bid_size_{t-1} + ask_size_{t-1}); zeros → NaN.
-    - If `window` is set, returns a rolling sum over that window (e.g., microstructural pressure).
-
-    Returns
-    -------
-    pd.Series named 'ofi' (or DataFrame with an 'ofi' column if as_frame=True and df provided).
-    """
-    # Support legacy positional DF usage
+    # legacy positional
     if df is None and len(args) >= 1 and isinstance(args[0], pd.DataFrame):
         df = args[0]
-
     if df is None:
-        raise ValueError("compute_ofi requires df=<quotes DataFrame>.")
+        raise ValueError("compute_ofi requires df=...")
 
     need = [bid_col, ask_col, bid_size_col, ask_size_col]
-    missing = [c for c in need if c not in df.columns]
-    if missing:
-        raise KeyError(f"compute_ofi: missing columns {missing}")
+    miss = [c for c in need if c not in df.columns]
+    if miss:
+        raise KeyError(f"compute_ofi: missing columns {miss}")
 
     pb = pd.to_numeric(df[bid_col], errors="coerce")
     pa = pd.to_numeric(df[ask_col], errors="coerce")
@@ -361,34 +309,159 @@ def compute_ofi(*args: Any,
     qa_prev = qa.shift()
 
     if method.lower() == "cont":
-        # Cont-style events using L1 snapshots
         ofi_bid = (dpb.gt(0).astype(float) * qb) - (dpb.lt(0).astype(float) * qb_prev)
         ofi_ask = (dpa.lt(0).astype(float) * qa_prev) - (dpa.gt(0).astype(float) * qa)
         ofi = ofi_bid.add(ofi_ask, fill_value=0.0)
     elif method.lower() in ("diff", "simple"):
-        # Simple approximation: size changes signed by best price move direction
         sgn_b = np.sign(dpb.fillna(0.0))
-        sgn_a = -np.sign(dpa.fillna(0.0))  # ask down = buy pressure (+)
+        sgn_a = -np.sign(dpa.fillna(0.0))  # ask down = buy pressure
         ofi = sgn_b * qb.diff().fillna(0.0) + sgn_a * qa.diff().fillna(0.0)
     else:
         raise ValueError(f"compute_ofi: unknown method '{method}'")
 
-    # Optional normalization by previous total depth
     if normalize:
         denom = qb_prev.add(qa_prev, fill_value=0.0).replace(0.0, np.nan)
         ofi = ofi / denom
 
-    # Optional rolling aggregation
     if window is not None and window > 1:
         ofi = ofi.rolling(int(window), min_periods=1).sum()
 
     ofi.name = "ofi"
-
-    if as_frame and df is not None:
-        out = df.copy()
-        out["ofi"] = ofi
-        return out[["ofi"]]
+    if as_frame:
+        return ofi.to_frame()
     return ofi
+
+
+# ----------------------------
+# Trade-Signed Volume (TSV): Lee–Ready with robust fallbacks
+# ----------------------------
+
+def _infer_mid(df: pd.DataFrame,
+               bid_col: str, ask_col: str, mid_col: Optional[str]) -> Optional[pd.Series]:
+    if mid_col and mid_col in df.columns:
+        return pd.to_numeric(df[mid_col], errors="coerce")
+    if bid_col in df.columns and ask_col in df.columns:
+        b = pd.to_numeric(df[bid_col], errors="coerce")
+        a = pd.to_numeric(df[ask_col], errors="coerce")
+        return 0.5 * (a + b)
+    return None
+
+
+def compute_trade_signed_volume(*args: Any,
+                                df: Optional[pd.DataFrame] = None,
+                                price: Optional[NumberLike] = None,
+                                volume: Optional[NumberLike] = None,
+                                # optional quotes-in-frame columns:
+                                bid_col: str = "bid",
+                                ask_col: str = "ask",
+                                mid_col: Optional[str] = None,
+                                # trades columns (DataFrame mode)
+                                price_col: str = "price",
+                                volume_col: str = "size",
+                                method: str = "lee_ready",
+                                normalize: bool = False,
+                                window: Optional[int] = None,
+                                as_frame: bool = True) -> Union[pd.Series, pd.DataFrame]:
+    """
+    Trade-signed volume (TSV).
+
+    Methods
+    -------
+    - 'lee_ready' (default): sign = sign(price_t - mid_{t-1}); ties -> tick test fallback.
+      Requires either columns for quotes in the same DataFrame (bid/ask or mid), or it falls
+      back to tick test if mid cannot be inferred.
+    - 'tick': sign = sign(price_t - price_{t-1}) with first tick = 0.
+
+    Normalization
+    -------------
+    If normalize=True, divides signed volume by absolute volume per tick.
+    If window is provided, a rolling sum is returned.
+    """
+    # If an upstream implementation exists, prefer it.
+    if _HAS_MF:
+        try:
+            from .micro_features import compute_trade_signed_volume as _mf_tsv  # type: ignore
+            return _mf_tsv(
+                df=df if df is not None else (args[0] if (len(args) >= 1 and isinstance(args[0], pd.DataFrame)) else None),
+                price=price, volume=volume,
+                bid_col=bid_col, ask_col=ask_col, mid_col=mid_col,
+                price_col=price_col, volume_col=volume_col,
+                method=method, normalize=normalize, window=window, as_frame=as_frame,
+            )
+        except Exception:
+            pass
+
+    # legacy positional DF
+    if df is None and len(args) >= 1 and isinstance(args[0], pd.DataFrame):
+        df = args[0]
+
+    # DataFrame mode
+    if df is not None:
+        if price_col not in df.columns or volume_col not in df.columns:
+            raise KeyError(f"compute_trade_signed_volume: missing '{price_col}' or '{volume_col}' columns.")
+        p = pd.to_numeric(df[price_col], errors="coerce")
+        v = pd.to_numeric(df[volume_col], errors="coerce")
+
+        method_l = method.lower()
+        if method_l == "lee_ready":
+            mid_prev = _infer_mid(df, bid_col, ask_col, mid_col)
+            if mid_prev is not None:
+                mid_prev = mid_prev.shift()  # Lee–Ready uses previous mid
+                sign = np.sign(p - mid_prev)
+                # tie-breaker: tick test
+                tie = (sign == 0) | (~np.isfinite(sign))
+                tick_sign = np.sign(p.diff().fillna(0.0))
+                sign = np.where(tie, tick_sign, sign)
+            else:
+                # no quotes available → tick test fallback
+                sign = np.sign(p.diff().fillna(0.0))
+        elif method_l == "tick":
+            sign = np.sign(p.diff().fillna(0.0))
+        else:
+            raise ValueError(f"compute_trade_signed_volume: unknown method '{method}'")
+
+        tsv = sign * v
+        if normalize:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                tsv = tsv / v.replace(0.0, np.nan)
+        if window is not None and window > 1:
+            tsv = tsv.rolling(int(window), min_periods=1).sum()
+
+        tsv.name = "ts_volume"
+        if as_frame:
+            return tsv.to_frame()
+        return tsv
+
+    # Vector/scalar mode
+    if price is None or volume is None:
+        raise ValueError("compute_trade_signed_volume requires either df=... or price/volume arrays.")
+
+    p_arr = _to_array(price).astype(float)
+    v_arr = _to_array(volume).astype(float)
+
+    method_l = method.lower()
+    if method_l == "lee_ready":
+        # Without quotes, lee_ready reduces to tick fallback.
+        sign = np.sign(np.diff(p_arr, prepend=p_arr[0]))
+    elif method_l == "tick":
+        sign = np.sign(np.diff(p_arr, prepend=p_arr[0]))
+    else:
+        raise ValueError(f"compute_trade_signed_volume: unknown method '{method}'")
+
+    tsv_arr = sign * v_arr
+    if normalize:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            tsv_arr = tsv_arr / np.where(v_arr == 0, np.nan, v_arr)
+    if window is not None and window > 1:
+        # simple rolling sum in numpy
+        w = int(window)
+        cumsum = np.cumsum(np.insert(tsv_arr, 0, 0.0))
+        tsv_arr = cumsum[w:] - cumsum[:-w]
+        # pad left
+        pad = np.full(w - 1, np.nan)
+        tsv_arr = np.concatenate([pad, tsv_arr])
+
+    return _return_like(tsv_arr, price, volume)
 
 
 __all__ = [
@@ -399,4 +472,5 @@ __all__ = [
     "add_l1_features",
     "compute_l1_metrics",
     "compute_ofi",
+    "compute_trade_signed_volume",
 ]
