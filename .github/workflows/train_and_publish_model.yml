@@ -36,6 +36,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt boto3
 
+      # --- CRITICAL FIXES FOR IMPORT PATHS ---
+      - name: Make local utils a proper package
+        working-directory: "Grond-main 2"
+        run: |
+          python - <<'PY'
+import pathlib
+p = pathlib.Path("utils/__init__.py")
+p.parent.mkdir(parents=True, exist_ok=True)
+if not p.exists():
+    p.write_text("# marker to make 'utils' a package\n")
+print("utils package ok at:", p.resolve())
+PY
+
+      - name: Export PYTHONPATH to include project root
+        run: |
+          echo "PYTHONPATH=${GITHUB_WORKSPACE}/Grond-main 2" >> $GITHUB_ENV
+          python - <<'PY'
+import os, sys
+print("PYTHONPATH:", os.environ.get("PYTHONPATH"))
+print("sys.path[0:3]:", sys.path[0:3])
+PY
+
       - name: Prepare training data
         working-directory: "Grond-main 2"
         env:
