@@ -1,23 +1,27 @@
- #!/usr/bin/env python3
-"""Prepare training data for movement classification.
+#!/usr/bin/env python3
+"""
+Prepare training data for movement classification.
 
-This script fetches historical OHLC bars, treasury yields, and option Greeks,
-computes a sliding window of features and labels, and writes the result to
-`data/movement_training_data.csv`.
+This script fetches historical OHLC bars, treasury yields, option Greeks,
+and **microstructure** features, computes a sliding window of features and
+labels, and writes the result to `data/movement_training_data.csv`.
 
-Changes:
+Logging:
 - Uses centralized JSON logging via utils.logging_utils.configure_logging()
-  (no basicConfig; no duplicate handlers).
-- Keeps /fed/v1/treasury-yields with limit=1&sort=date.desc for latest record.
+
+New in this version:
+- Integrates NBBO-derived microstructure features (historical spreads, depth
+  imbalance, OFI, signed volume, VPIN) per 5-minute bucket and aligns them to
+  bar time for the classifier to learn from orderbook dynamics.
 """
 
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
-from typing import Any, Dict, List
-
 import logging
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
 import requests
 
@@ -34,16 +38,18 @@ from utils import (
     compute_skew_ratio,
     fetch_option_greeks,
 )
+from utils.micro_features import build_microstructure_features
 
 # Configure logging once (JSON, singleton)
 configure_logging()
 logger = get_logger(__name__)
 
-# Fetch Treasury Yields once
+# Polygon Treasury Yields endpoint (single request; cached)
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
 YIELDS_ENDPOINT = "https://api.polygon.io/fed/v1/treasury-yields"
 
-def fetch_treasury_yields(date: str | None = None) -> Dict[str, Any]:
+
+def fetch_treasury_yields(date: Optional[str] = None) -> Dict[str, Any]:
     """Fetch treasury yields for a specific date (or latest) from Polygon."""
     params: Dict[str, Any] = {"apiKey": POLYGON_API_KEY}
     if date:
@@ -56,37 +62,68 @@ def fetch_treasury_yields(date: str | None = None) -> Dict[str, Any]:
     resp.raise_for_status()
     results = resp.json().get("results", [])
     if not results:
-        logger.warning('No yield data returned for date=%s', date)
+        logger.warning("No yield data returned for date=%s", date)
         return {}
     record = results[0]
-    logger.info('Fetched treasury yields for date=%s', record.get("date"))
+    logger.info("Fetched treasury yields for date=%s", record.get("date"))
     return record
 
-# Cache yields once
+
+# Cache yields once per run
 YIELDS = fetch_treasury_yields()
 
-# Output Configuration
+# Output configuration
 OUTPUT_DIR = "data"
 OUTPUT_FILE = "movement_training_data.csv"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
 
-# Parameters (CI / env override)
+# Parameters (can be overridden via env)
 HIST_DAYS = int(os.getenv("HIST_DAYS", "90"))
 LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "18"))
 LOOKAHEAD_BARS = int(os.getenv("LOOKAHEAD_BARS", "2"))
 
+
+def _asof_micro(
+    ms_df: pd.DataFrame,
+    ts: pd.Timestamp,
+    fields: List[str],
+) -> Dict[str, float]:
+    """
+    Return most recent microstructure values at or before `ts` for listed fields.
+    """
+    if ms_df.empty:
+        return {f: float("nan") for f in fields}
+    # Ensure UTC for alignment
+    ts_utc = ts.tz_convert("UTC") if ts.tzinfo else ts.tz_localize("UTC")
+    try:
+        row = ms_df.loc[:ts_utc].iloc[-1]
+        return {f: float(row.get(f, float("nan"))) for f in fields}
+    except Exception:
+        return {f: float("nan") for f in fields}
+
+
 def extract_features_and_label(symbol: str) -> pd.DataFrame:
     """
-    Fetch historical bars and compute sliding-window features and labels for a symbol.
-
-    Returns a DataFrame of features (including yields and Greeks) plus movement_type.
+    Fetch historical bars and compute sliding-window features, Greeks, yields,
+    **plus microstructure features**, and assign movement_type labels.
     """
     end = datetime.now(tz)
     start = end - timedelta(days=HIST_DAYS)
+
+    # Historical bars
     loader = HistoricalDataLoader()
     raw_bars = loader.fetch_bars(symbol, start, end)
-    logger.info('Fetched %d bars for %s over %d days', len(raw_bars), symbol, HIST_DAYS)
+    logger.info("Fetched %d bars for %s over %d days", len(raw_bars), symbol, HIST_DAYS)
+
+    if not raw_bars:
+        return pd.DataFrame(columns=[
+            "symbol","breakout_prob","recent_move_pct","time_of_day","volume_ratio",
+            "rsi","corr_dev","skew_ratio","yield_spike_2year","yield_spike_10year",
+            "yield_spike_30year","delta","gamma","theta","vega","rho","vanna",
+            "vomma","movement_type","theta_day","theta_5m",
+            "ms_spread_mean","ms_depth_imbalance_mean","ms_ofi_sum","ms_signed_volume_sum","ms_vpin",
+        ])
 
     df = pd.DataFrame(
         [
@@ -101,35 +138,38 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
             for b in raw_bars
         ]
     )
-    if df.empty:
-        logger.warning("No bars for %s; returning empty frame", symbol)
-        return pd.DataFrame(columns=[
-            "symbol","breakout_prob","recent_move_pct","time_of_day","volume_ratio",
-            "rsi","corr_dev","skew_ratio","yield_spike_2year","yield_spike_10year",
-            "yield_spike_30year","delta","gamma","theta","vega","rho","vanna",
-            "vomma","movement_type","theta_day","theta_5m"
-        ])
-
     df["dt"] = (
-        pd.to_datetime(df["timestamp"], unit="ms")
-        .dt.tz_localize("UTC")
+        pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         .dt.tz_convert(tz)
     )
     df.set_index("dt", inplace=True)
 
+    # Static yields for the run
     ys2 = float(YIELDS.get("yield_2_year", 0.0))
     ys10 = float(YIELDS.get("yield_10_year", 0.0))
     ys30 = float(YIELDS.get("yield_30_year", 0.0))
+
+    # Option Greeks snapshot(s)
     greeks = fetch_option_greeks(symbol)
     logger.info(
         "Using yields (2y=%s,10y=%s,30y=%s) and Greeks for %s",
         ys2, ys10, ys30, symbol,
     )
 
+    # Build microstructure features on the same horizon, bucketed to 5m
+    ms_df = build_microstructure_features(
+        symbol,
+        start=df.index[0].to_pydatetime(),
+        end=df.index[-1].to_pydatetime(),
+        bucket="5min",
+        include_trades=True,
+    )
+
     records: List[Dict[str, Any]] = []
     for i in range(LOOKBACK_BARS, len(df) - LOOKAHEAD_BARS):
         window = df.iloc[i - LOOKBACK_BARS:i]
         current = df.iloc[i]
+
         candles = window.reset_index().to_dict("records")
 
         feat: Dict[str, Any] = {
@@ -147,8 +187,9 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
             **greeks,
         }
 
+        # Label based on lookahead close vs current close
         next_bar = df.iloc[i + LOOKAHEAD_BARS]
-        delta = (next_bar["close"] - current["close"]) / current["close"]
+        delta = (next_bar["close"] - current["close"]) / current["close"] if current["close"] else 0.0
         if delta > 0:
             feat["movement_type"] = "CALL"
         elif delta < 0:
@@ -158,17 +199,28 @@ def extract_features_and_label(symbol: str) -> pd.DataFrame:
 
         theta_raw = float(greeks.get("theta", 0.0))
         feat["theta_day"] = theta_raw
-        feat["theta_5m"] = theta_raw / 78.0
+        feat["theta_5m"] = theta_raw / 78.0  # 6.5h * 60 / 5 = 78 bars in RTH
+
+        # Attach microstructure features as-of the current bar end
+        ms_fields = [
+            "ms_spread_mean",
+            "ms_depth_imbalance_mean",
+            "ms_ofi_sum",
+            "ms_signed_volume_sum",
+            "ms_vpin",
+        ]
+        feat.update(_asof_micro(ms_df, current.name.tz_convert("UTC"), ms_fields))
 
         records.append(feat)
 
     return pd.DataFrame(records)
 
+
 def main() -> None:
     """Generate training data for all tickers and write to CSV."""
     out_frames: List[pd.DataFrame] = []
     for t in TICKERS:
-        logger.info('Generating data for %s', t)
+        logger.info("Generating data for %s", t)
         out_frames.append(extract_features_and_label(t))
 
     if not out_frames:
@@ -179,9 +231,11 @@ def main() -> None:
     if full.empty:
         logger.warning("No rows generated; nothing to write.")
         return
+
     full = full.sample(frac=1.0, random_state=42).reset_index(drop=True)
     full.to_csv(OUTPUT_PATH, index=False)
-    logger.info('✅ Saved %d rows to %s', len(full), OUTPUT_PATH)
+    logger.info("✅ Saved %d rows to %s", len(full), OUTPUT_PATH)
+
 
 if __name__ == "__main__":
     main()
