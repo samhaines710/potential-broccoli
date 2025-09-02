@@ -11,7 +11,8 @@ Exposes:
 - imbalance(bid_size, ask_size)
 - add_l1_features(df, bid_col="bid", ask_col="ask", bid_size_col="bid_size", ask_size_col="ask_size",
                   prefix=None, price_scale=1.0)
-- compute_l1_metrics(...)  <-- added for compatibility with utils.__init__ imports
+- compute_l1_metrics(...)
+- compute_ofi(...)            <-- added (Cont-style OFI over L1 quotes)
 
 Design:
 - Vectorized; safe for scalars, numpy arrays, or pandas Series/DataFrames.
@@ -306,6 +307,90 @@ def compute_l1_metrics(*args: Any,
     }
 
 
+# ----------------------------
+# Order Flow Imbalance (OFI)
+# ----------------------------
+
+def compute_ofi(*args: Any,
+                df: Optional[pd.DataFrame] = None,
+                bid_col: str = "bid",
+                ask_col: str = "ask",
+                bid_size_col: str = "bid_size",
+                ask_size_col: str = "ask_size",
+                method: str = "cont",
+                normalize: bool = False,
+                window: Optional[int] = None,
+                as_frame: bool = True) -> Union[pd.Series, pd.DataFrame]:
+    """
+    Compute Order Flow Imbalance (OFI) from L1 quotes.
+
+    Default 'cont' method (Cont, Kukanov & Stoikov 2011, L1 approximation):
+        ofi_t = 1_{Δbid>0} * bid_size_t   - 1_{Δbid<0} * bid_size_{t-1}
+              + 1_{Δask<0} * ask_size_{t-1} - 1_{Δask>0} * ask_size_t
+
+    Notes
+    -----
+    - Uses previous tick sizes where required.
+    - If `normalize=True`, divides by (bid_size_{t-1} + ask_size_{t-1}); zeros → NaN.
+    - If `window` is set, returns a rolling sum over that window (e.g., microstructural pressure).
+
+    Returns
+    -------
+    pd.Series named 'ofi' (or DataFrame with an 'ofi' column if as_frame=True and df provided).
+    """
+    # Support legacy positional DF usage
+    if df is None and len(args) >= 1 and isinstance(args[0], pd.DataFrame):
+        df = args[0]
+
+    if df is None:
+        raise ValueError("compute_ofi requires df=<quotes DataFrame>.")
+
+    need = [bid_col, ask_col, bid_size_col, ask_size_col]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise KeyError(f"compute_ofi: missing columns {missing}")
+
+    pb = pd.to_numeric(df[bid_col], errors="coerce")
+    pa = pd.to_numeric(df[ask_col], errors="coerce")
+    qb = pd.to_numeric(df[bid_size_col], errors="coerce")
+    qa = pd.to_numeric(df[ask_size_col], errors="coerce")
+
+    dpb = pb.diff()
+    dpa = pa.diff()
+    qb_prev = qb.shift()
+    qa_prev = qa.shift()
+
+    if method.lower() == "cont":
+        # Cont-style events using L1 snapshots
+        ofi_bid = (dpb.gt(0).astype(float) * qb) - (dpb.lt(0).astype(float) * qb_prev)
+        ofi_ask = (dpa.lt(0).astype(float) * qa_prev) - (dpa.gt(0).astype(float) * qa)
+        ofi = ofi_bid.add(ofi_ask, fill_value=0.0)
+    elif method.lower() in ("diff", "simple"):
+        # Simple approximation: size changes signed by best price move direction
+        sgn_b = np.sign(dpb.fillna(0.0))
+        sgn_a = -np.sign(dpa.fillna(0.0))  # ask down = buy pressure (+)
+        ofi = sgn_b * qb.diff().fillna(0.0) + sgn_a * qa.diff().fillna(0.0)
+    else:
+        raise ValueError(f"compute_ofi: unknown method '{method}'")
+
+    # Optional normalization by previous total depth
+    if normalize:
+        denom = qb_prev.add(qa_prev, fill_value=0.0).replace(0.0, np.nan)
+        ofi = ofi / denom
+
+    # Optional rolling aggregation
+    if window is not None and window > 1:
+        ofi = ofi.rolling(int(window), min_periods=1).sum()
+
+    ofi.name = "ofi"
+
+    if as_frame and df is not None:
+        out = df.copy()
+        out["ofi"] = ofi
+        return out[["ofi"]]
+    return ofi
+
+
 __all__ = [
     "calc_spread",
     "midprice",
@@ -313,4 +398,5 @@ __all__ = [
     "imbalance",
     "add_l1_features",
     "compute_l1_metrics",
+    "compute_ofi",
 ]
