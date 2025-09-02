@@ -1,0 +1,96 @@
+name: Generate Data, Train & Publish Model
+
+on:
+  push:
+    paths:
+      - "prepare_training_data.py"
+      - "train_ml_classifier.py"
+      - "utils/**"
+      - "data/**"
+      - ".github/workflows/train_and_publish_model.yml"
+  workflow_dispatch:
+
+jobs:
+  train-and-upload:
+    name: Train & Upload to S3
+    runs-on: ubuntu-latest
+    environment: CI   # pull secrets/vars from your CI environment
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt boto3
+
+      - name: Prepare training data
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+        run: |
+          mkdir -p data
+          python prepare_training_data.py
+          test -s data/movement_training_data.csv
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ vars.AWS_DEFAULT_REGION }}
+
+      - name: Derive S3 URIs
+        id: s3vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          uri="${{ vars.ML_MODEL_PATH }}"
+          if [[ "$uri" != s3://* ]]; then
+            echo "ML_MODEL_PATH must be an s3:// URI; got: $uri" >&2
+            exit 1
+          fi
+          bucket="${uri#s3://}"; bucket="${bucket%%/*}"
+          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+          echo "model_uri=$uri" >> "$GITHUB_OUTPUT"
+          echo "csv_uri=s3://$bucket/data/movement_training_data.csv" >> "$GITHUB_OUTPUT"
+
+      - name: Upload training CSV to S3
+        run: |
+          aws s3 cp data/movement_training_data.csv '${{ steps.s3vars.outputs.csv_uri }}' --only-show-errors
+
+      - name: Train model pipeline
+        run: |
+          mkdir -p models
+          python train_ml_classifier.py \
+            --train-csv   data/movement_training_data.csv \
+            --label-col   movement_type \
+            --model-dir   models \
+            --model-filename xgb_classifier.pipeline.joblib
+          test -s models/xgb_classifier.pipeline.joblib
+
+      - name: Upload model artifact to S3
+        run: |
+          aws s3 cp models/xgb_classifier.pipeline.joblib '${{ steps.s3vars.outputs.model_uri }}' --only-show-errors
+
+      - name: Upload artifacts to GitHub (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-and-data
+          path: |
+            data/movement_training_data.csv
+            models/xgb_classifier.pipeline.joblib
+          if-no-files-found: error
