@@ -34,13 +34,12 @@ def _ok(msg: str) -> None:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 0) Stub external network call BEFORE importing prepare_training_data
-#    (Polygon Treasury yields requested at import time there)
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     import requests  # real module
 except Exception:
-    requests = types.ModuleType("requests")  # minimal shim if not installed
-    sys.modules["requests"] = requests  # make importable elsewhere
+    requests = types.ModuleType("requests")
+    sys.modules["requests"] = requests
 
 class _FakeResp:
     def __init__(self):
@@ -53,19 +52,16 @@ class _FakeResp:
             }]
         }
         self.status_code = 200
-    def raise_for_status(self):
+    def raise_for_status(self):  # noqa: D401
         return None
     def json(self):
         return self._json
 
 def _fake_get(url, params=None, timeout=10, **kwargs):
-    # Only stub the Polygon yields endpoint; fall back otherwise if desired
     if isinstance(url, str) and "polygon.io/fed/v1/treasury-yields" in url:
         return _FakeResp()
-    # Conservative default: also return OK for any requests (CI should be offline)
     return _FakeResp()
 
-# Patch requests.get in-process so any import-time call is safe
 setattr(requests, "get", _fake_get)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -123,9 +119,20 @@ except Exception:
     mf = types.ModuleType("utils.micro_features")
     sys.modules["utils.micro_features"] = mf
 
+def _to_utc(ts) -> pd.Timestamp:
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        return t.tz_localize("UTC")
+    return t.tz_convert("UTC")
+
 def _stub_build_microstructure_features(symbol, start, end, bucket="5min", include_trades=True):
-    idx = pd.date_range(pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC"),
-                        freq="5min", inclusive="both")
+    s_utc = _to_utc(start)
+    e_utc = _to_utc(end)
+    if e_utc < s_utc:
+        s_utc, e_utc = e_utc, s_utc  # swap if inverted
+    idx = pd.date_range(start=s_utc, end=e_utc, freq="5min", inclusive="both")
+    if len(idx) == 0:
+        idx = pd.date_range(start=s_utc, periods=30, freq="5min")
     rng = np.random.default_rng(42)
     df = pd.DataFrame(index=idx)
     df["ms_spread_mean"] = rng.uniform(0.005, 0.02, size=len(df))
