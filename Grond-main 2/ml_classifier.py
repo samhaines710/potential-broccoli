@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
 ML Classifier for movement_type prediction.
 
@@ -17,11 +20,12 @@ from __future__ import annotations
 import io
 import os
 import re
+from typing import Any, Dict, List, Tuple
+
 import boto3
 import joblib
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, List, Tuple
 
 from utils.logging_utils import get_logger, write_status, configure_logging
 
@@ -38,6 +42,7 @@ try:
 except Exception:
     _orig_isnan = None  # type: ignore
 
+
 def _isnan_safe(x: Any):
     """Return isnan(x) when x is numeric; for object/string inputs return False/zeros."""
     if _orig_isnan is None:
@@ -51,6 +56,7 @@ def _isnan_safe(x: Any):
             return np.zeros(x.shape, dtype=bool)
         return False
 
+
 # Monkey-patch numpy.isnan in-process (safe for our runtime)
 np.isnan = _isnan_safe  # type: ignore
 
@@ -59,19 +65,21 @@ np.isnan = _isnan_safe  # type: ignore
 # ──────────────────────────────────────────────────────────────────────────────
 
 CALL_LABEL = "CALL"
-PUT_LABEL  = "PUT"
-NEU_LABEL  = "NEUTRAL"
+PUT_LABEL = "PUT"
+NEU_LABEL = "NEUTRAL"
 ORDERED_LABELS = [CALL_LABEL, PUT_LABEL, NEU_LABEL]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # S3 helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _parse_s3_uri(uri: str) -> Tuple[str, str]:
     m = re.match(r"^s3://([^/]+)/(.+)$", uri)
     if not m:
         raise ValueError(f"Invalid S3 URI: {uri}")
     return m.group(1), m.group(2)
+
 
 def _download_from_s3(s3_uri: str) -> bytes:
     bucket, key = _parse_s3_uri(s3_uri)
@@ -83,6 +91,7 @@ def _download_from_s3(s3_uri: str) -> bytes:
     write_status("Model downloaded successfully.")
     return buf.read()
 
+
 def _load_pipeline(model_uri: str):
     write_status(f"Loading ML pipeline from {model_uri}")
     if model_uri.startswith("s3://"):
@@ -93,9 +102,11 @@ def _load_pipeline(model_uri: str):
     write_status("ML pipeline loaded successfully.")
     return pipe
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Feature-frame utilities
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _coerce_val(v: Any) -> Any:
     """Try to coerce numerics to float; leave strings as str; fallback safe."""
@@ -107,10 +118,12 @@ def _coerce_val(v: Any) -> Any:
         return float(bool(v))
     return str(v)
 
+
 def _ensure_frame(features: Dict[str, Any]) -> pd.DataFrame:
     """Build a one-row DataFrame with coerced values."""
     row = {k: _coerce_val(v) for k, v in features.items()}
     return pd.DataFrame([row])
+
 
 def _expected_features_for_pipeline(pipeline, df_cols) -> List[str]:
     """
@@ -141,6 +154,7 @@ def _expected_features_for_pipeline(pipeline, df_cols) -> List[str]:
 
     # 3) Fallback: current DataFrame columns
     return list(df_cols)
+
 
 def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -180,6 +194,12 @@ def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFram
         "implied_volatility": 0.0,
         "theta_day": 0.0,
         "theta_5m": 0.0,
+        # microstructure fields that may be absent in some payloads
+        "ms_spread_mean": 0.0,
+        "ms_depth_imbalance_mean": 0.0,
+        "ms_ofi_sum": 0.0,
+        "ms_signed_volume_sum": 0.0,
+        "ms_vpin": 0.0,
     }
 
     for col in expected:
@@ -199,9 +219,11 @@ def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFram
 
     return df, filled
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Class/label utilities
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _map_class_index_to_label(classes: np.ndarray, idx: int) -> str:
     """Map estimator.classes_ value at index idx to canonical label."""
@@ -218,19 +240,42 @@ def _map_class_index_to_label(classes: np.ndarray, idx: int) -> str:
         return sval
     return NEU_LABEL
 
-def _extract_probs_in_order(classes: np.ndarray, proba_row: np.ndarray) -> List[float]:
-    """Return probabilities in [CALL, PUT, NEUTRAL] order regardless of estimator.classes_ order."""
-    idx_map: Dict[str, int] = {}
-    for i, _ in enumerate(classes):
-        idx_map[_map_class_index_to_label(classes, i)] = i
-    p_call = float(proba_row[idx_map.get(CALL_LABEL, 0)])
-    p_put  = float(proba_row[idx_map.get(PUT_LABEL, 1 if len(proba_row) > 1 else 0)])
-    p_neu  = float(proba_row[idx_map.get(NEU_LABEL, 2 if len(proba_row) > 2 else 0)])
+
+def _probs_canonical(classes: np.ndarray, proba_row: np.ndarray) -> List[float]:
+    """
+    Map model probs → [CALL, PUT, NEUTRAL] in a robust way.
+
+    - If the model is tri-class, return the three probabilities in canonical order.
+    - If the model is binary (missing NEUTRAL), set p_neutral=0.0 and
+      renormalize [p_call, p_put] to sum to 1.0 to avoid leaking mass.
+    - If a class is missing entirely, its probability is 0.0.
+    """
+    classes = np.asarray(classes)
+    idx = {str(c).upper(): i for i, c in enumerate(classes)}
+
+    p_call = float(proba_row[idx["CALL"]]) if "CALL" in idx else 0.0
+    p_put = float(proba_row[idx["PUT"]]) if "PUT" in idx else 0.0
+    p_neu = float(proba_row[idx["NEUTRAL"]]) if "NEUTRAL" in idx else 0.0
+
+    # If NEUTRAL is missing (typical binary model), renormalize CALL/PUT.
+    if "NEUTRAL" not in idx:
+        s2 = p_call + p_put
+        if s2 > 0:
+            p_call, p_put = p_call / s2, p_put / s2
+        p_neu = 0.0
+        return [p_call, p_put, p_neu]
+
+    # Tri-class path: soft-normalize against numeric drift
+    s = p_call + p_put + p_neu
+    if s > 0:
+        return [p_call / s, p_put / s, p_neu / s]
     return [p_call, p_put, p_neu]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public classifier
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class MLClassifier:
     def __init__(self) -> None:
@@ -249,15 +294,21 @@ class MLClassifier:
         df = _ensure_frame(features)
         df, _ = _align_columns_for_pipeline(df, self.pipeline)
 
+        # Predict probabilities
         proba = self.pipeline.predict_proba(df)[0]
+
+        # Obtain classes_ from pipeline or final estimator
         classes = getattr(self.pipeline, "classes_", None)
         if classes is None:
-            # Some sklearn Pipelines keep classes_ on the final estimator
             final_est = getattr(self.pipeline, "steps", [[None, None]])[-1][1]
-            classes = getattr(final_est, "classes_", np.array([CALL_LABEL, PUT_LABEL, NEU_LABEL]))
+            classes = getattr(final_est, "classes_", np.array(["CALL", "PUT", "NEUTRAL"]))
 
-        label_idx = int(np.argmax(proba))
-        label = _map_class_index_to_label(classes, label_idx)
-        probs = _extract_probs_in_order(classes, proba)
+        # Canonicalize probabilities into [CALL, PUT, NEUTRAL],
+        # supporting both tri-class and binary models
+        probs = _probs_canonical(np.asarray(classes), np.asarray(proba))
+
+        # Argmax on canonical order yields the final label
+        label_idx = int(np.argmax(probs))
+        label = ["CALL", "PUT", "NEUTRAL"][label_idx]
 
         return {"movement_type": label, "probs": probs}
