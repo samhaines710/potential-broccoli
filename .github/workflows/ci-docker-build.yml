@@ -9,7 +9,7 @@ on:
       - '**'
 
 env:
-  # Your app lives in this subfolder (note the space). Change to "." if you later move it.
+  # Change to "." if you later move code to repo root
   APP_DIR: "Grond-main 2"
 
 jobs:
@@ -43,7 +43,7 @@ jobs:
           elif [[ -f "requirements.txt" ]]; then
             pip install --no-cache-dir -r "requirements.txt"
           fi
-          # safety net for import-time deps used by validators
+          # Safety net for import-time deps used by validators
           pip install --no-cache-dir requests ruff pytest joblib boto3 scikit-learn
 
       - name: Lint (ruff, warn-only)
@@ -71,10 +71,10 @@ jobs:
       - name: Build Docker image (no push; load for local run)
         uses: docker/build-push-action@v6
         with:
-          context: ${{ env.APP_DIR }}                # build context is the subdir
-          file: ${{ env.APP_DIR }}/Dockerfile        # Dockerfile in that subdir
+          context: ${{ env.APP_DIR }}           # build context is the subdir
+          file: ${{ env.APP_DIR }}/Dockerfile   # Dockerfile in that subdir
           push: false
-          load: true                                 # load image into local daemon
+          load: true                            # load image into local daemon
           tags: local/potential-broccoli:ci
 
       - name: Run validations inside Docker image
