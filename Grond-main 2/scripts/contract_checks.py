@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-Integration contract checks to catch stale wiring across modules.
+Integration contract checks to catch stale wiring across modules, with
+network calls stubbed to avoid external API dependencies in CI.
 
 What this does:
 1) Validate utils.microstructure export surface.
-2) Stub ingestion/micro builder/greeks; run prepare_training_data.extract_features_and_label.
-3) Force MLClassifier to use a binary dummy model; validate Option-B probability mapping.
+2) Stub: requests.get (Polygon yields), ingestion, micro builder, greeks.
+3) Import and run prepare_training_data.extract_features_and_label.
+4) Exercise MLClassifier with a binary dummy model (Option-B mapping).
 """
 
 from __future__ import annotations
@@ -30,7 +32,45 @@ def _fail(msg: str, code: int = 1) -> None:
 def _ok(msg: str) -> None:
     print(f"[CONTRACT-OK] {msg}")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 0) Stub external network call BEFORE importing prepare_training_data
+#    (Polygon Treasury yields requested at import time there)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    import requests  # real module
+except Exception:
+    requests = types.ModuleType("requests")  # minimal shim if not installed
+    sys.modules["requests"] = requests  # make importable elsewhere
+
+class _FakeResp:
+    def __init__(self):
+        self._json = {
+            "results": [{
+                "date": "2025-01-02",
+                "yield_2_year": 4.40,
+                "yield_10_year": 4.10,
+                "yield_30_year": 4.20,
+            }]
+        }
+        self.status_code = 200
+    def raise_for_status(self):
+        return None
+    def json(self):
+        return self._json
+
+def _fake_get(url, params=None, timeout=10, **kwargs):
+    # Only stub the Polygon yields endpoint; fall back otherwise if desired
+    if isinstance(url, str) and "polygon.io/fed/v1/treasury-yields" in url:
+        return _FakeResp()
+    # Conservative default: also return OK for any requests (CI should be offline)
+    return _FakeResp()
+
+# Patch requests.get in-process so any import-time call is safe
+setattr(requests, "get", _fake_get)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 1) Microstructure export surface
+# ──────────────────────────────────────────────────────────────────────────────
 REQUIRED = {
     "calc_spread",
     "midprice",
@@ -52,7 +92,9 @@ if missing:
     _fail(f"utils.microstructure missing exports: {missing}")
 _ok("utils.microstructure export surface OK")
 
-# 2) Stub ingestion + micro feature builder + greeks; run dataset builder
+# ──────────────────────────────────────────────────────────────────────────────
+# 2) Stub ingestion + micro feature builder + greeks
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     import data_ingestion as di
 except Exception as e:
@@ -82,7 +124,8 @@ except Exception:
     sys.modules["utils.micro_features"] = mf
 
 def _stub_build_microstructure_features(symbol, start, end, bucket="5min", include_trades=True):
-    idx = pd.date_range(pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC"), freq="5min", inclusive="both")
+    idx = pd.date_range(pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC"),
+                        freq="5min", inclusive="both")
     rng = np.random.default_rng(42)
     df = pd.DataFrame(index=idx)
     df["ms_spread_mean"] = rng.uniform(0.005, 0.02, size=len(df))
@@ -108,12 +151,15 @@ def _stub_fetch_option_greeks(symbol: str):
 
 uroot.fetch_option_greeks = _stub_fetch_option_greeks  # type: ignore[attr-defined]
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 3) Import prepare_training_data AFTER stubs; run feature/label build
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     import prepare_training_data as ptd
 except Exception as e:
     _fail(f"Cannot import prepare_training_data: {e}")
 
-# Reduce env horizon for speed
+# Reduce horizon for speed
 os.environ["HIST_DAYS"] = "2"
 os.environ["LOOKBACK_BARS"] = "6"
 os.environ["LOOKAHEAD_BARS"] = "2"
@@ -136,7 +182,9 @@ if missing_cols:
 
 _ok(f"prepare_training_data emitted {len(df)} rows with required columns")
 
-# 3) MLClassifier with binary model (Option-B mapping)
+# ──────────────────────────────────────────────────────────────────────────────
+# 4) MLClassifier with binary model (Option-B mapping)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     import ml_classifier as mlc
 except Exception as e:
