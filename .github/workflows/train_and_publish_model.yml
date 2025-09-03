@@ -13,9 +13,22 @@ jobs:
     runs-on: ubuntu-latest
     environment: CI
 
+    # Single source of truth for region; ensure CLI/boto3 see it as default too
+    env:
+      APP_DIR: "Grond-main 2"
+      AWS_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Show repo layout (debug)
+        run: |
+          pwd
+          ls -la
+          ls -la "${{ env.APP_DIR }}" || true
+          ls -la "${{ env.APP_DIR }}/data" || true
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -31,36 +44,54 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install dependencies
-        working-directory: "Grond-main 2"
+        working-directory: "${{ env.APP_DIR }}"
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt boto3
+          pip install --no-cache-dir -r requirements.txt boto3 awscli
 
       - name: Ensure local utils is a package
-        working-directory: "Grond-main 2"
+        working-directory: "${{ env.APP_DIR }}"
         run: |
-          python -c "import pathlib; p=pathlib.Path('utils/__init__.py'); p.parent.mkdir(parents=True, exist_ok=True); (p.exists() or p.write_text('# package'))"
+          python - <<'PY'
+import pathlib
+p = pathlib.Path("utils/__init__.py")
+p.parent.mkdir(parents=True, exist_ok=True)
+if not p.exists():
+    p.write_text("# package\n")
+print("utils/ package present")
+PY
 
       - name: Prepare training data
-        working-directory: "Grond-main 2"
+        working-directory: "${{ env.APP_DIR }}"
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: |
           mkdir -p data
-          python prepare_training_data.py
+          python -u prepare_training_data.py
           test -s data/movement_training_data.csv
+
+      # Fail fast if region is not set (the credentials action requires an explicit input)
+      - name: Validate AWS region variable
+        shell: bash
+        run: |
+          if [[ -z "${AWS_REGION:-}" ]]; then
+            echo "ERROR: Repository variable AWS_DEFAULT_REGION is not set." >&2
+            echo "Set it under Repo → Settings → Variables → Actions: AWS_DEFAULT_REGION (e.g., eu-north-1)" >&2
+            exit 1
+          fi
+          echo "AWS region resolved to: ${AWS_REGION}"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_DEFAULT_REGION }}
+          aws-region: ${{ env.AWS_REGION }}  # REQUIRED input; do not rely on env alone
 
-      - name: Install AWS CLI
+      - name: Verify caller and region
         run: |
-          python -m pip install --upgrade awscli
-          aws --version
+          aws sts get-caller-identity
+          aws configure list
 
       - name: Derive S3 URIs
         id: s3vars
@@ -69,26 +100,34 @@ jobs:
           ML_MODEL_PATH: ${{ vars.ML_MODEL_PATH }}
         run: |
           set -euo pipefail
-          uri="$ML_MODEL_PATH"
+          uri="${ML_MODEL_PATH:-}"
+          if [[ -z "$uri" ]]; then
+            echo "ERROR: Repo variable ML_MODEL_PATH is not set (expected s3://bucket/path/model.joblib)" >&2
+            exit 1
+          fi
           if [[ "$uri" != s3://* ]]; then
-            echo "ML_MODEL_PATH must be an s3:// URI; got: $uri" >&2
+            echo "ERROR: ML_MODEL_PATH must be an s3:// URI; got: $uri" >&2
             exit 1
           fi
           bucket="${uri#s3://}"; bucket="${bucket%%/*}"
           echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
           echo "model_uri=$uri" >> "$GITHUB_OUTPUT"
           echo "csv_uri=s3://$bucket/data/movement_training_data.csv" >> "$GITHUB_OUTPUT"
+          echo "Derived:"
+          echo "  bucket:   $bucket"
+          echo "  model:    $uri"
+          echo "  csv:      s3://$bucket/data/movement_training_data.csv"
 
       - name: Upload training CSV to S3
-        working-directory: "Grond-main 2"
+        working-directory: "${{ env.APP_DIR }}"
         run: |
           aws s3 cp data/movement_training_data.csv "${{ steps.s3vars.outputs.csv_uri }}" --only-show-errors
 
       - name: Train model pipeline
-        working-directory: "Grond-main 2"
+        working-directory: "${{ env.APP_DIR }}"
         run: |
           mkdir -p models
-          python train_ml_classifier.py \
+          python -u train_ml_classifier.py \
             --train-csv data/movement_training_data.csv \
             --label-col movement_type \
             --model-dir models \
@@ -96,7 +135,7 @@ jobs:
           test -s models/xgb_classifier.pipeline.joblib
 
       - name: Upload model artifact to S3
-        working-directory: "Grond-main 2"
+        working-directory: "${{ env.APP_DIR }}"
         run: |
           aws s3 cp models/xgb_classifier.pipeline.joblib "${{ steps.s3vars.outputs.model_uri }}" --only-show-errors
 
