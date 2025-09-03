@@ -15,23 +15,23 @@ ENV PYTHONUNBUFFERED=1 \
     MODEL_URI=/app/models/xgb_classifier.pipeline.joblib \
     ML_MODEL_PATH=/app/models/xgb_classifier.pipeline.joblib
 
-# Python deps (expects requirements.txt in this folder/context)
+# Dependencies (expects requirements.txt in this folder)
 COPY requirements.txt /tmp/requirements.txt
 RUN python -m pip install --upgrade pip \
  && if [ -s /tmp/requirements.txt ]; then pip install --no-cache-dir -r /tmp/requirements.txt; fi \
  && pip install --no-cache-dir boto3 requests
 
-# Application code
+# App code
 COPY . /app
 
-# Create model dir (as root) so it's present regardless of user
+# Ensure model dir exists (root)
 RUN mkdir -p /app/models
 
-# Entry script: copy and chmod as root (must be BEFORE USER switch)
+# Copy entrypoint as root, set perms
 COPY scripts/docker_entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 0755 /usr/local/bin/entrypoint.sh
+RUN chown root:root /usr/local/bin/entrypoint.sh && chmod 0755 /usr/local/bin/entrypoint.sh
 
-# Non-root user & ownership of app dir
+# Drop privileges for runtime
 RUN addgroup --system app && adduser --system --ingroup app app \
  && chown -R app:app /app
 USER app
