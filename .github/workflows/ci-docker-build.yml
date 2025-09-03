@@ -7,11 +7,14 @@ on:
     branches: ["**"]
 
 env:
-  APP_DIR: "Grond-main 2"   # <-- your subfolder with a space
+  # If you later move code to repo root, change this to "."
+  APP_DIR: "Grond-main 2"
 
 jobs:
   build-and-validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,6 +23,7 @@ jobs:
         run: |
           pwd
           ls -la
+          ls -la "${{ env.APP_DIR }}" || true
           ls -la "${{ env.APP_DIR }}/scripts" || true
 
       - name: Set up Python
@@ -27,11 +31,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies (from subdir)
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pytest ruff joblib boto3 scikit-learn
+          if [ -f "${{ env.APP_DIR }}/requirements.txt" ]; then
+            pip install --no-cache-dir -r "${{ env.APP_DIR }}/requirements.txt"
+          elif [ -f "requirements.txt" ]; then
+            pip install --no-cache-dir -r "requirements.txt"
+          fi
+          # safety net in case requirements.txt missed anything used at import time
+          pip install --no-cache-dir requests ruff pytest joblib boto3 scikit-learn
+          python - <<'PY'
+import importlib, sys
+try:
+    importlib.import_module("requests")
+    print("requests OK")
+except Exception as e:
+    sys.exit(f"requests missing: {e}")
+PY
+
+      - name: Lint (ruff, warn-only)
+        run: ruff check . || true
 
       - name: Validate repository (syntax + internal import symbols)
         env:
@@ -45,6 +65,12 @@ jobs:
           MODEL_URI: local://dummy
         run: |
           python -u "${{ env.APP_DIR }}/scripts/contract_checks.py"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image (no push)
         uses: docker/build-push-action@v6
