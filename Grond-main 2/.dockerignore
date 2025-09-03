@@ -1,0 +1,38 @@
+# VCS
+.git
+.gitignore
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# Build/Test
+build/
+dist/
+.coverage
+.pytest_cache/
+
+# Editors/OS
+.idea/
+.vscode/
+.DS_Store
+
+# CI
+.github/
+
+# Data & models (unless you really want to COPY them)
+data/
+models/
+
+# Node/other
+node_modules/
+
+# Big files you don't need in image
+*.parquet
+*.csv
+*.feather
