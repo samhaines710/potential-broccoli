@@ -2,63 +2,49 @@ name: ci
 
 on:
   push:
-    branches: [ "**" ]
+    branches: ["**"]
   pull_request:
-    branches: [ "**" ]
+    branches: ["**"]
+
+env:
+  APP_DIR: "Grond-main 2"   # <-- your subfolder with a space
 
 jobs:
   build-and-validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Show repo layout (debug)
+        run: |
+          pwd
+          ls -la
+          ls -la "${{ env.APP_DIR }}/scripts" || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
-        shell: bash
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install --no-cache-dir -r requirements.txt
-          fi
-          pip install --no-cache-dir pytest ruff joblib boto3 scikit-learn
-
-      - name: Lint (ruff, warn-only)
-        run: |
-          ruff check . || true
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest ruff joblib boto3 scikit-learn
 
       - name: Validate repository (syntax + internal import symbols)
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: "${{ github.workspace }}/${{ env.APP_DIR }}"
         run: |
-          python -u scripts/repo_validation.py
+          python -u "${{ env.APP_DIR }}/scripts/repo_validation.py"
 
       - name: Contract checks (dataset + classifier wiring)
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: "${{ github.workspace }}/${{ env.APP_DIR }}"
           MODEL_URI: local://dummy
         run: |
-          python -u scripts/contract_checks.py
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          python -u "${{ env.APP_DIR }}/scripts/contract_checks.py"
 
       - name: Build Docker image (no push)
         uses: docker/build-push-action@v6
@@ -70,10 +56,11 @@ jobs:
 
       - name: Run validations inside Docker image
         env:
+          APP_DIR: ${{ env.APP_DIR }}
           MODEL_URI: local://dummy
         run: |
           docker run --rm \
             -e MODEL_URI \
-            -e PYTHONPATH=/app \
+            -e PYTHONPATH="/app/${APP_DIR}" \
             local/potential-broccoli:ci \
-            bash -lc "python -u scripts/repo_validation.py && python -u scripts/contract_checks.py"
+            bash -lc 'python -u "${APP_DIR}/scripts/repo_validation.py" && python -u "${APP_DIR}/scripts/contract_checks.py"'
