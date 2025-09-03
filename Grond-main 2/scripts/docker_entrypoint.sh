@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# MODEL_URI can be a local path (default) or s3://bucket/key
+# MODEL_URI can be a local path or s3://bucket/key
 MODEL_URI="${MODEL_URI:-/app/models/xgb_classifier.pipeline.joblib}"
 AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-eu-north-1}"
 
