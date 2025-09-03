@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# MODEL_URI can be a local path (default in Dockerfile) or s3://bucket/key
+# MODEL_URI can be a local path (default) or s3://bucket/key
 MODEL_URI="${MODEL_URI:-/app/models/xgb_classifier.pipeline.joblib}"
 AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-eu-north-1}"
 
 mkdir -p "$(dirname "$MODEL_URI")"
 
-# If MODEL_URI is an S3 URI, download once to the canonical local model path
+# If MODEL_URI is s3://..., download once to the canonical local path
 if [[ "$MODEL_URI" == s3://* ]]; then
   if [[ ! -f "/app/models/model.loaded" ]]; then
     python - <<PY
