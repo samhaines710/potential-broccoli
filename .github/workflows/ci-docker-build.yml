@@ -2,12 +2,14 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    branches:
+      - '**'
   pull_request:
-    branches: ["**"]
+    branches:
+      - '**'
 
 env:
-  # If you later move code to repo root, change this to "."
+  # Change to "." if you move code to repo root
   APP_DIR: "Grond-main 2"
 
 jobs:
@@ -29,26 +31,19 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies (from subdir)
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          if [ -f "${{ env.APP_DIR }}/requirements.txt" ]; then
+          if [[ -f "${{ env.APP_DIR }}/requirements.txt" ]]; then
             pip install --no-cache-dir -r "${{ env.APP_DIR }}/requirements.txt"
-          elif [ -f "requirements.txt" ]; then
+          elif [[ -f "requirements.txt" ]]; then
             pip install --no-cache-dir -r "requirements.txt"
           fi
-          # safety net in case requirements.txt missed anything used at import time
+          # safety net for import-time deps
           pip install --no-cache-dir requests ruff pytest joblib boto3 scikit-learn
-          python - <<'PY'
-import importlib, sys
-try:
-    importlib.import_module("requests")
-    print("requests OK")
-except Exception as e:
-    sys.exit(f"requests missing: {e}")
-PY
 
       - name: Lint (ruff, warn-only)
         run: ruff check . || true
@@ -89,4 +84,4 @@ PY
             -e MODEL_URI \
             -e PYTHONPATH="/app/${APP_DIR}" \
             local/potential-broccoli:ci \
-            bash -lc 'python -u "${APP_DIR}/scripts/repo_validation.py" && python -u "${APP_DIR}/scripts/contract_checks.py"'
+            bash -lc "python -u \"${APP_DIR}/scripts/repo_validation.py\" && python -u \"${APP_DIR}/scripts/contract_checks.py\""
