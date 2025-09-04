@@ -11,12 +11,12 @@ jobs:
   train-and-upload:
     name: Train & Upload to S3
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     environment: CI
 
     env:
       APP_DIR: "Grond-main 2"
-      AWS_REGION: ${{ vars.AWS_DEFAULT_REGION }}
-      AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+      # Canonical naming for tinabobina
       S3_BUCKET: tinabobina
       MODEL_KEY: models/tinabobina.pipeline.joblib
       MODEL_OUT: models/tinabobina.pipeline.joblib
@@ -25,6 +25,84 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ---- Resolve config EARLY (no training yet) ----
+      - name: Resolve configuration (region & URIs)
+        id: cfg
+        shell: bash
+        env:
+          VAR_REGION: ${{ vars.AWS_DEFAULT_REGION }}   # may be empty
+          VAR_MODEL_URI: ${{ vars.ML_MODEL_PATH }}     # optional override
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+          MODEL_KEY: ${{ env.MODEL_KEY }}
+        run: |
+          set -euo pipefail
+          # Region resolution with safe default (eu-north-1). Adjust if needed.
+          REGION="${VAR_REGION:-}"
+          if [[ -z "$REGION" ]]; then
+            REGION="eu-north-1"
+            echo "No AWS_DEFAULT_REGION repo variable set; defaulting to: $REGION"
+          fi
+          echo "aws_region=$REGION" >> "$GITHUB_OUTPUT"
+
+          # Model URI: prefer repo variable if provided; else construct default
+          if [[ -n "${VAR_MODEL_URI:-}" ]]; then
+            MODEL_URI="$VAR_MODEL_URI"
+          else
+            MODEL_URI="s3://${S3_BUCKET}/${MODEL_KEY}"
+          fi
+          if [[ "${MODEL_URI}" != s3://* ]]; then
+            echo "ERROR: Model URI must be s3://... (got: ${MODEL_URI})" >&2
+            exit 1
+          fi
+          echo "model_uri=$MODEL_URI" >> "$GITHUB_OUTPUT"
+
+          # CSV URI for dataset
+          CSV_URI="s3://${S3_BUCKET}/data/movement_training_data.csv"
+          echo "csv_uri=$CSV_URI" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved config:"
+          echo "  aws_region = $REGION"
+          echo "  model_uri  = $MODEL_URI"
+          echo "  csv_uri    = $CSV_URI"
+
+      # ---- Configure AWS creds FIRST, then prove access BEFORE any training ----
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ steps.cfg.outputs.aws_region }}
+
+      - name: Verify AWS caller and bucket region
+        shell: bash
+        env:
+          REGION: ${{ steps.cfg.outputs.aws_region }}
+          BUCKET: ${{ env.S3_BUCKET }}
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+          echo "Workflow region: ${REGION}"
+          # Check actual bucket region to avoid 301 redirects & auth confusion
+          LOC="$(aws s3api get-bucket-location --bucket "${BUCKET}" --query 'LocationConstraint' --output text)"
+          [[ "$LOC" == "None" ]] && LOC="us-east-1"
+          echo "Bucket region:   ${LOC}"
+          if [[ "${LOC}" != "${REGION}" ]]; then
+            echo "WARNING: Bucket is in ${LOC} but job is configured for ${REGION}. Consider aligning regions." >&2
+          fi
+
+      - name: Preflight S3 write (fail fast if blocked)
+        shell: bash
+        env:
+          BUCKET: ${{ env.S3_BUCKET }}
+        run: |
+          set -euo pipefail
+          KEY="ci-preflight/${GITHUB_RUN_ID}-${GITHUB_SHA}.txt"
+          echo "preflight $(date -u +%FT%TZ) run=${GITHUB_RUN_ID} sha=${GITHUB_SHA}" > /tmp/preflight.txt
+          aws s3 cp /tmp/preflight.txt "s3://${BUCKET}/${KEY}" --only-show-errors
+          aws s3 rm "s3://${BUCKET}/${KEY}" --only-show-errors
+          echo "Preflight S3 write/delete OK."
+
+      # ---- Only now do we install deps & run training ----
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
@@ -49,7 +127,7 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         shell: bash
         run: |
-          python -c "import pathlib; p=pathlib.Path('utils/__init__.py'); p.parent.mkdir(parents=True, exist_ok=True); (p.exists() or p.write_text('# package\n')); print('utils/ package present')"
+          python -c "import pathlib; p=pathlib.Path('utils/__init__.py'); p.parent.mkdir(parents=True, exist_ok=True); (p.exists() or p.write_text('# package\n'))"
 
       - name: Prepare training data
         working-directory: ${{ env.APP_DIR }}
@@ -57,64 +135,22 @@ jobs:
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: |
+          set -euo pipefail
           mkdir -p data
           python -u prepare_training_data.py
           test -s data/movement_training_data.csv
-
-      - name: Validate AWS region variable
-        shell: bash
-        run: |
-          if [[ -z "${AWS_REGION:-}" ]]; then
-            echo "ERROR: Repository variable AWS_DEFAULT_REGION is not set." >&2
-            exit 1
-          fi
-          echo "AWS region: ${AWS_REGION}"
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Verify caller and region
-        shell: bash
-        run: |
-          aws sts get-caller-identity
-          aws configure list
-
-      - name: Resolve S3 URIs
-        id: s3vars
-        shell: bash
-        env:
-          ML_MODEL_PATH_VAR: ${{ vars.ML_MODEL_PATH }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${ML_MODEL_PATH_VAR:-}" ]]; then
-            uri="${ML_MODEL_PATH_VAR}"
-          else
-            uri="s3://${S3_BUCKET}/${MODEL_KEY}"
-            echo "ML_MODEL_PATH not set; defaulting to: ${uri}"
-          fi
-          if [[ "${uri}" != s3://* ]]; then
-            echo "ERROR: ML_MODEL_PATH must be an s3:// URI (got: ${uri})" >&2
-            exit 1
-          fi
-          bucket="${uri#s3://}"; bucket="${bucket%%/*}"
-          echo "bucket=${bucket}" >> "$GITHUB_OUTPUT"
-          echo "model_uri=${uri}" >> "$GITHUB_OUTPUT"
-          echo "csv_uri=s3://${bucket}/data/movement_training_data.csv" >> "$GITHUB_OUTPUT"
 
       - name: Upload training CSV to S3
         working-directory: ${{ env.APP_DIR }}
         shell: bash
         run: |
-          aws s3 cp data/movement_training_data.csv "${{ steps.s3vars.outputs.csv_uri }}" --only-show-errors
+          aws s3 cp data/movement_training_data.csv "${{ steps.cfg.outputs.csv_uri }}" --only-show-errors
 
       - name: Train model pipeline (tinabobina)
         working-directory: ${{ env.APP_DIR }}
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p models
           python -u train_ml_classifier.py \
             --train-csv data/movement_training_data.csv \
@@ -127,7 +163,7 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         shell: bash
         run: |
-          aws s3 cp models/tinabobina.pipeline.joblib "${{ steps.s3vars.outputs.model_uri }}" --only-show-errors
+          aws s3 cp models/tinabobina.pipeline.joblib "${{ steps.cfg.outputs.model_uri }}" --only-show-errors
 
       - name: Upload artifacts to GitHub
         uses: actions/upload-artifact@v4
