@@ -17,7 +17,7 @@ jobs:
       # Subfolder (quoted because of the space)
       APP_DIR: "Grond-main 2"
 
-      # Region (set repo variable AWS_DEFAULT_REGION, e.g., eu-north-1)
+      # Region (define repo variable AWS_DEFAULT_REGION, e.g., eu-north-1)
       AWS_REGION: ${{ vars.AWS_DEFAULT_REGION }}
       AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
 
@@ -45,18 +45,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: "${{ runner.os }}-pip-${{ hashFiles('Grond-main 2/requirements.txt') }}"
+          key: ${{ runner.os }}-pip-${{ hashFiles('Grond-main 2/requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
       - name: Install dependencies
-        working-directory: "${{ env.APP_DIR }}"
+        working-directory: ${{ env.APP_DIR }}
         run: |
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt boto3 awscli
 
       - name: Ensure local utils is a package
-        working-directory: "${{ env.APP_DIR }}"
+        working-directory: ${{ env.APP_DIR }}
         run: |
           python - <<'PY'
 import pathlib
@@ -68,7 +68,7 @@ print("utils/ package present")
 PY
 
       - name: Prepare training data
-        working-directory: "${{ env.APP_DIR }}"
+        working-directory: ${{ env.APP_DIR }}
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: |
@@ -127,25 +127,25 @@ PY
           echo "  csv_uri:   s3://${bucket}/data/movement_training_data.csv"
 
       - name: Upload training CSV to S3
-        working-directory: "${{ env.APP_DIR }}"
+        working-directory: ${{ env.APP_DIR }}
         run: |
           aws s3 cp data/movement_training_data.csv "${{ steps.s3vars.outputs.csv_uri }}" --only-show-errors
 
       - name: Train model pipeline (tinabobina)
-        working-directory: "${{ env.APP_DIR }}"
+        working-directory: ${{ env.APP_DIR }}
         run: |
           mkdir -p models
           python -u train_ml_classifier.py \
             --train-csv data/movement_training_data.csv \
             --label-col movement_type \
             --model-dir models \
-            --model-filename "$(basename "${MODEL_OUT}")"
-          test -s "${MODEL_OUT}"
+            --model-filename tinabobina.pipeline.joblib
+          test -s models/tinabobina.pipeline.joblib
 
       - name: Upload model artifact to S3
-        working-directory: "${{ env.APP_DIR }}"
+        working-directory: ${{ env.APP_DIR }}
         run: |
-          aws s3 cp "${MODEL_OUT}" "${{ steps.s3vars.outputs.model_uri }}" --only-show-errors
+          aws s3 cp models/tinabobina.pipeline.joblib "${{ steps.s3vars.outputs.model_uri }}" --only-show-errors
 
       - name: Upload artifacts to GitHub
         uses: actions/upload-artifact@v4
@@ -153,5 +153,5 @@ PY
           name: model-and-data
           path: |
             Grond-main 2/data/movement_training_data.csv
-            Grond-main 2/${{ env.MODEL_OUT }}
+            Grond-main 2/models/tinabobina.pipeline.joblib
           if-no-files-found: error
