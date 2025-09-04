@@ -49,14 +49,7 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         shell: bash
         run: |
-          python - <<'PY'
-import pathlib
-p = pathlib.Path("utils/__init__.py")
-p.parent.mkdir(parents=True, exist_ok=True)
-if not p.exists():
-    p.write_text("# package\n")
-print("utils/ package present")
-PY
+          python -c "import pathlib; p=pathlib.Path('utils/__init__.py'); p.parent.mkdir(parents=True, exist_ok=True); (p.exists() or p.write_text('# package\n')); print('utils/ package present')"
 
       - name: Prepare training data
         working-directory: ${{ env.APP_DIR }}
@@ -95,8 +88,6 @@ PY
         shell: bash
         env:
           ML_MODEL_PATH_VAR: ${{ vars.ML_MODEL_PATH }}
-          S3_BUCKET: ${{ env.S3_BUCKET }}
-          MODEL_KEY: ${{ env.MODEL_KEY }}
         run: |
           set -euo pipefail
           if [[ -n "${ML_MODEL_PATH_VAR:-}" ]]; then
