@@ -14,14 +14,9 @@ jobs:
     environment: CI
 
     env:
-      # Subfolder (quoted because of the space)
       APP_DIR: "Grond-main 2"
-
-      # Region (define repo variable AWS_DEFAULT_REGION, e.g., eu-north-1)
       AWS_REGION: ${{ vars.AWS_DEFAULT_REGION }}
       AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
-
-      # Canonical naming (bucket + model)
       S3_BUCKET: tinabobina
       MODEL_KEY: models/tinabobina.pipeline.joblib
       MODEL_OUT: models/tinabobina.pipeline.joblib
@@ -29,12 +24,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Show repo layout (debug)
-        run: |
-          pwd
-          ls -la
-          ls -la "${{ env.APP_DIR }}" || true
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -51,12 +40,14 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ env.APP_DIR }}
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt boto3 awscli
 
       - name: Ensure local utils is a package
         working-directory: ${{ env.APP_DIR }}
+        shell: bash
         run: |
           python - <<'PY'
 import pathlib
@@ -69,6 +60,7 @@ PY
 
       - name: Prepare training data
         working-directory: ${{ env.APP_DIR }}
+        shell: bash
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: |
@@ -93,13 +85,12 @@ PY
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Verify caller and region
+        shell: bash
         run: |
           aws sts get-caller-identity
           aws configure list
 
-      # Resolve target S3 URIs. If ML_MODEL_PATH is set as a repo variable, use it;
-      # otherwise default to s3://tinabobina/models/tinabobina.pipeline.joblib
-      - name: Resolve S3 URIs (use ML_MODEL_PATH if provided)
+      - name: Resolve S3 URIs
         id: s3vars
         shell: bash
         env:
@@ -122,17 +113,16 @@ PY
           echo "bucket=${bucket}" >> "$GITHUB_OUTPUT"
           echo "model_uri=${uri}" >> "$GITHUB_OUTPUT"
           echo "csv_uri=s3://${bucket}/data/movement_training_data.csv" >> "$GITHUB_OUTPUT"
-          echo "Resolved:"
-          echo "  model_uri: ${uri}"
-          echo "  csv_uri:   s3://${bucket}/data/movement_training_data.csv"
 
       - name: Upload training CSV to S3
         working-directory: ${{ env.APP_DIR }}
+        shell: bash
         run: |
           aws s3 cp data/movement_training_data.csv "${{ steps.s3vars.outputs.csv_uri }}" --only-show-errors
 
       - name: Train model pipeline (tinabobina)
         working-directory: ${{ env.APP_DIR }}
+        shell: bash
         run: |
           mkdir -p models
           python -u train_ml_classifier.py \
@@ -144,6 +134,7 @@ PY
 
       - name: Upload model artifact to S3
         working-directory: ${{ env.APP_DIR }}
+        shell: bash
         run: |
           aws s3 cp models/tinabobina.pipeline.joblib "${{ steps.s3vars.outputs.model_uri }}" --only-show-errors
 
