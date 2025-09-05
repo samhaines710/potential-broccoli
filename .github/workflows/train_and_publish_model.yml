@@ -11,14 +11,14 @@ jobs:
   train-and-upload:
     name: Train & Upload to S3
     runs-on: ubuntu-latest
-    environment: CI   # <- must match your Environment name exactly
+    environment: CI   # must match your Environment name exactly
 
-    # Required for GitHub OIDC → STS
+    # Needed for GitHub OIDC → AWS STS
     permissions:
       id-token: write
       contents: read
 
-    # Make POLYGON_API_KEY visible to all steps and Python processes
+    # Make the Polygon key visible to all steps & Python imports
     env:
       POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
 
@@ -59,7 +59,7 @@ jobs:
           print("utils package OK")
           PY
 
-      # --- OIDC: assume your role "tigermoon" ---
+      # --- OIDC: assume role 'tigermoon' in your AWS account ---
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -68,8 +68,8 @@ jobs:
           role-duration-seconds: 21600
           aws-region: eu-north-1
 
-      # Fail fast so long training doesn't die at upload time
-      - name: Verify caller & preflight S3 write/delete
+      # Sanity check AWS identity + S3 write/delete in bucket root
+      - name: Verify caller & preflight S3 write/delete (bucket root)
         env:
           BUCKET: tinabobina
         run: |
@@ -81,15 +81,14 @@ jobs:
           aws s3 rm "s3://${BUCKET}/${KEY}" --only-show-errors
           echo "Preflight S3 write/delete OK."
 
-      # Fail fast if the Polygon key isn't visible/valid
+      # Fail fast if Polygon key not present or invalid
       - name: Preflight Polygon API key
         run: |
           set -euo pipefail
           if [[ -z "${POLYGON_API_KEY:-}" ]]; then
-            echo "POLYGON_API_KEY not visible to this job (wrong environment or missing secret)." >&2
+            echo "POLYGON_API_KEY not visible to this job (missing secret or wrong Environment)." >&2
             exit 2
           fi
-          # Tiny call just to verify credentials/entitlements are good
           code=$(curl -s -o /dev/null -w "%{http_code}" \
             "https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2025-08-01/2025-08-02?limit=1&apiKey=${POLYGON_API_KEY}")
           if [[ "$code" != "200" ]]; then
@@ -106,6 +105,22 @@ jobs:
           python prepare_training_data.py
           test -s data/movement_training_data.csv
 
+      # Optional: quick CSV sanity report (does not fail the job)
+      - name: Training CSV sanity report
+        working-directory: "Grond-main 2"
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import pandas as pd
+          df = pd.read_csv("data/movement_training_data.csv")
+          print({"rows": len(df), "cols": list(df.columns)})
+          micro = ["ms_spread_mean","ms_depth_imbalance_mean","ms_ofi_sum","ms_signed_volume_sum","ms_vpin"]
+          existing = [c for c in micro if c in df.columns]
+          if existing:
+              miss = df[existing].isna().mean().to_dict()
+              print({"microstructure_missing_rate": miss})
+          PY
+
       - name: Train model pipeline
         working-directory: "Grond-main 2"
         run: |
@@ -118,6 +133,53 @@ jobs:
             --model-filename xgb_classifier.pipeline.joblib
           test -s models/xgb_classifier.pipeline.joblib
 
+      # Resolve model S3 path, validate bucket/region, probe write/delete in prefix
+      - name: Preflight model S3 URI
+        id: model_s3
+        env:
+          ML_MODEL_PATH: ${{ vars.ML_MODEL_PATH }}   # set in Env/Repo Variables
+          DEFAULT_URI: s3://tinabobina/models/xgb_classifier.pipeline.joblib
+        run: |
+          set -euo pipefail
+          URI="${ML_MODEL_PATH:-$DEFAULT_URI}"
+          if [[ "${URI}" != s3://* ]]; then
+            echo "ML_MODEL_PATH/DEFAULT_URI must be s3://... ; got: ${URI}" >&2
+            exit 1
+          fi
+          bucket="${URI#s3://}"; bucket="${bucket%%/*}"
+          rest="${URI#s3://$bucket/}"
+          if [[ -z "${bucket}" || -z "${rest}" || "${rest}" == "${URI}" ]]; then
+            echo "Malformed S3 URI (missing bucket or key): ${URI}" >&2
+            exit 1
+          fi
+          key="${rest}"
+          prefix="$(dirname "${key}")"
+
+          # Bucket exists?
+          aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 || {
+            echo "Cannot access bucket: s3://${bucket}" >&2
+            exit 2
+          }
+
+          # Region note (warn only)
+          want_region="${AWS_REGION:-${AWS_DEFAULT_REGION:-eu-north-1}}"
+          got_region="$(aws s3api get-bucket-location --bucket "$bucket" --query 'LocationConstraint' --output text)"
+          [[ "${got_region}" == "None" ]] && got_region="us-east-1"
+          if [[ -n "${want_region}" && "${got_region}" != "${want_region}" ]]; then
+            echo "NOTE: Bucket region is ${got_region}, runner region is ${want_region}." >&2
+          fi
+
+          # Probe write/delete in prefix
+          tmp="/tmp/preflight.txt"
+          echo "ok $(date -u +%FT%TZ)" > "$tmp"
+          probe_key="${prefix%/}/_preflight_${GITHUB_RUN_ID}_${GITHUB_SHA}.txt"
+          aws s3 cp "$tmp" "s3://${bucket}/${probe_key}" --only-show-errors
+          aws s3 rm "s3://${bucket}/${probe_key}" --only-show-errors
+          echo "Preflight write/delete OK for s3://${bucket}/${prefix%/}/"
+
+          # Export validated URI
+          echo "model_uri=s3://${bucket}/${key}" >> "$GITHUB_OUTPUT"
+
       - name: Upload training CSV to S3
         working-directory: "Grond-main 2"
         run: |
@@ -126,19 +188,11 @@ jobs:
 
       - name: Upload model artifact to S3
         working-directory: "Grond-main 2"
-        env:
-          MODEL_URI: ${{ vars.ML_MODEL_PATH }}
         run: |
           set -euo pipefail
-          if [[ -z "${MODEL_URI:-}" ]]; then
-            echo "Repository variable ML_MODEL_PATH is required (e.g., s3://tinabobina/models/xgb_classifier.pipeline.joblib)" >&2
-            exit 1
-          fi
-          if [[ "${MODEL_URI}" != s3://* ]]; then
-            echo "ML_MODEL_PATH must be an s3:// URI; got: ${MODEL_URI}" >&2
-            exit 1
-          fi
-          aws s3 cp models/xgb_classifier.pipeline.joblib "${MODEL_URI}" --only-show-errors
+          URI="${{ steps.model_s3.outputs.model_uri }}"
+          echo "Uploading model -> ${URI}"
+          aws s3 cp models/xgb_classifier.pipeline.joblib "${URI}" --only-show-errors
 
       - name: Upload artifacts to GitHub
         uses: actions/upload-artifact@v4
