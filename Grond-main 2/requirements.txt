@@ -21,10 +21,9 @@ scikit-learn>=1.4.2,<1.6
 xgboost>=2.0.3,<2.1
 optuna>=3.5
 
-# ── Reinforcement Learning stack (Gym + SB3 + Torch CPU) ──────────────────────
+# ── RL stack (Gym + SB3 + Torch CPU) ──────────────────────────────────────────
 gymnasium>=0.28
-# CPU wheels for CI/runners; if you use GPUs elsewhere, pin torch accordingly there.
-torch>=2.2,<2.3
+torch>=2.2,<2.3           # CPU wheels; pin GPU separately if needed
 stable-baselines3>=2.2
 
 # ── Quant / Portfolio / Optimization ──────────────────────────────────────────
@@ -32,16 +31,18 @@ cvxpy>=1.4.2
 PyPortfolioOpt>=1.5
 riskfolio-lib>=4.4
 
-# ── Trading frameworks ────────────────────────────────────────────────────────
-# NOTE: These ecosystems carry tight version constraints. Pins below are widely used,
-# but if you hit conflicts with pandas/numpy, consider isolating them in a separate venv.
-backtrader==1.9.78.123
-zipline-reloaded==3.0.3
+# ── Trading frameworks (NOT 3.11-compatible) ──────────────────────────────────
+backtrader==1.9.78.123; python_version < "3.11"
+zipline-reloaded==3.0.3; python_version < "3.11"
+python-interface>=1.5.3; python_version < "3.11"
+
+# (Optional) JAX is heavy and version-sensitive; keep it off CI 3.11
+jax[cpu]>=0.4.26; python_version < "3.11"
 
 # ── Brokers / Connectivity ────────────────────────────────────────────────────
 ib_insync>=0.9.86
 
-# ── QuantLib (PyPI package is "QuantLib", import as "QuantLib") ───────────────
+# ── QuantLib (PyPI pkg is "QuantLib") ─────────────────────────────────────────
 QuantLib>=1.31
 
 # ── Web frameworks / serving ──────────────────────────────────────────────────
