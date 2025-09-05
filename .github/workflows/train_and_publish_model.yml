@@ -11,11 +11,16 @@ jobs:
   train-and-upload:
     name: Train & Upload to S3
     runs-on: ubuntu-latest
+    environment: CI   # <- must match your Environment name exactly
 
     # Required for GitHub OIDC → STS
     permissions:
       id-token: write
       contents: read
+
+    # Make POLYGON_API_KEY visible to all steps and Python processes
+    env:
+      POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
 
     steps:
       - name: Checkout
@@ -76,10 +81,25 @@ jobs:
           aws s3 rm "s3://${BUCKET}/${KEY}" --only-show-errors
           echo "Preflight S3 write/delete OK."
 
+      # Fail fast if the Polygon key isn't visible/valid
+      - name: Preflight Polygon API key
+        run: |
+          set -euo pipefail
+          if [[ -z "${POLYGON_API_KEY:-}" ]]; then
+            echo "POLYGON_API_KEY not visible to this job (wrong environment or missing secret)." >&2
+            exit 2
+          fi
+          # Tiny call just to verify credentials/entitlements are good
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/2025-08-01/2025-08-02?limit=1&apiKey=${POLYGON_API_KEY}")
+          if [[ "$code" != "200" ]]; then
+            echo "Polygon preflight failed, HTTP $code (bad key or missing entitlements)." >&2
+            exit 3
+          fi
+          echo "Polygon key OK."
+
       - name: Prepare training data
         working-directory: "Grond-main 2"
-        env:
-          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: |
           set -euo pipefail
           mkdir -p data
