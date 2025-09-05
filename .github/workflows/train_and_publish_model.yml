@@ -11,13 +11,14 @@ jobs:
   train-and-upload:
     name: Train & Upload to S3
     runs-on: ubuntu-latest
-    environment: CI  # must match your Environment name exactly
+    environment: CI
 
+    # Required for GitHub OIDC → STS
     permissions:
       id-token: write
       contents: read
 
-    # Expose Polygon key to later steps (prepare_training_data.py). Not used during early S3 preflight.
+    # Available later to prepare_training_data.py (not used during S3 preflight)
     env:
       POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
 
@@ -25,7 +26,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 1) OIDC to AWS (needed for S3 preflight) ─────────────────────────────
+      # ── 1) Assume AWS role via OIDC (needed for S3 preflight) ─────────────────
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -34,7 +35,7 @@ jobs:
           role-duration-seconds: 21600
           aws-region: eu-north-1
 
-      # ── 2) EARLY S3 PREFLIGHT: validate ML_MODEL_PATH and write/delete access ─
+      # ── 2) EARLY S3 PREFLIGHT: validate ML_MODEL_PATH + write/delete probe ───
       - name: Preflight model S3 URI (early)
         id: model_s3
         env:
@@ -82,20 +83,7 @@ jobs:
           # Export validated URI for later upload step
           echo "model_uri=s3://${bucket}/${key}" >> "$GITHUB_OUTPUT"
 
-      # (Optional) root-level S3 sanity; useful during IAM hardening
-      - name: Verify caller & root write/delete (optional)
-        env:
-          BUCKET: tinabobina
-        run: |
-          set -euo pipefail
-          aws sts get-caller-identity
-          echo "ok $(date -u +%FT%TZ)" > /tmp/root-preflight.txt
-          KEY="ci-preflight/${GITHUB_RUN_ID}-${GITHUB_SHA}.txt"
-          aws s3 cp /tmp/root-preflight.txt "s3://${BUCKET}/${KEY}" --only-show-errors
-          aws s3 rm "s3://${BUCKET}/${KEY}" --only-show-errors
-          echo "Root S3 preflight OK."
-
-      # ── 3) Python 3.11 after S3 is confirmed ─────────────────────────────────
+      # ── 3) Python 3.11 setup (only after S3 is confirmed) ────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -105,21 +93,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: "${{ runner.os }}-pip-${{ hashFiles('Grond-main 2/requirements-ml.txt', 'Grond-main 2/requirements.txt') }}"
+          key: "${{ runner.os }}-pip-${{ hashFiles('Grond-main 2/requirements.txt') }}"
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install dependencies (prefers requirements-ml.txt)
+      - name: Install dependencies (single requirements.txt)
         working-directory: "Grond-main 2"
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip setuptools wheel
+          # Prefer wheels to avoid slow source builds on CI
           export PIP_ONLY_BINARY=:all:
-          if [[ -f "requirements-ml.txt" ]]; then
-            pip install --no-cache-dir -r requirements-ml.txt awscli
-          else
-            pip install --no-cache-dir -r requirements.txt awscli
-          fi
+          pip install --no-cache-dir -r requirements.txt awscli
 
       - name: Ensure local utils is a package
         working-directory: "Grond-main 2"
@@ -134,7 +119,7 @@ jobs:
           print("utils package OK")
           PY
 
-      # ── 4) Data prep (uses Polygon), then training ───────────────────────────
+      # ── 4) Data prep (Polygon) ───────────────────────────────────────────────
       - name: Prepare training data
         working-directory: "Grond-main 2"
         run: |
@@ -158,6 +143,7 @@ jobs:
               print({"microstructure_missing_rate": miss})
           PY
 
+      # ── 5) Train ─────────────────────────────────────────────────────────────
       - name: Train model pipeline
         working-directory: "Grond-main 2"
         run: |
@@ -170,7 +156,7 @@ jobs:
             --model-filename xgb_classifier.pipeline.joblib
           test -s models/xgb_classifier.pipeline.joblib
 
-      # ── 5) Uploads ───────────────────────────────────────────────────────────
+      # ── 6) Uploads ───────────────────────────────────────────────────────────
       - name: Upload training CSV to S3
         working-directory: "Grond-main 2"
         run: |
