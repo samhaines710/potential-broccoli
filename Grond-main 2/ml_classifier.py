@@ -22,10 +22,15 @@ import os
 import re
 from typing import Any, Dict, List, Tuple
 
-import boto3
 import joblib
 import numpy as np
 import pandas as pd
+
+# Optional boto3 (only required if using s3:// MODEL_URI)
+try:  # pragma: no cover
+    import boto3  # type: ignore
+except Exception:  # pragma: no cover
+    boto3 = None  # type: ignore
 
 from utils.logging_utils import get_logger, write_status, configure_logging
 
@@ -82,6 +87,8 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
 
 
 def _download_from_s3(s3_uri: str) -> bytes:
+    if boto3 is None:
+        raise RuntimeError("boto3 is not available but an s3:// MODEL_URI was provided.")
     bucket, key = _parse_s3_uri(s3_uri)
     write_status(f"Downloading model from {s3_uri}")
     s3 = boto3.client("s3")
@@ -284,7 +291,7 @@ def _probs_canonical(classes: np.ndarray, proba_row: np.ndarray) -> List[float]:
 
 class MLClassifier:
     def __init__(self, model_path: str | None = None) -> None:
-        model_uri = model_path or os.getenv(\"MODEL_URI\", \"s3://bucketbuggypie/models/xgb_classifier.pipeline.joblib\")
+        model_uri = model_path or os.getenv("MODEL_URI", "s3://bucketbuggypie/models/xgb_classifier.pipeline.joblib")
         self.pipeline = _load_pipeline(model_uri)
 
     def classify(self, features: Dict[str, Any]) -> Dict[str, Any]:
@@ -293,53 +300,66 @@ class MLClassifier:
         Returns:
             {
               "movement_type": "CALL"|"PUT"|"NEUTRAL",
-              "probs": [p_call, p_put, p_neutral]
+              "probs": [p_call, p_put, p_neutral],
+              "expected_move_pct": float
             }
         """
         df = _ensure_frame(features)
         df, _ = _align_columns_for_pipeline(df, self.pipeline)
 
-        # Predict probabilities
-        proba = self.pipeline.predict_proba(df)[0]
+        # Predict probabilities (try predict_proba; fallback to calibrated pseudoprobs)
+        try:
+            proba = self.pipeline.predict_proba(df)[0]
+        except AttributeError:
+            if hasattr(self.pipeline, "decision_function"):
+                scores = np.asarray(self.pipeline.decision_function(df))[0]
+                exp = np.exp(scores - np.max(scores))
+                proba = exp / np.sum(exp)
+            else:
+                pred = self.pipeline.predict(df)[0]
+                # one-hot fallback
+                final_est = getattr(self.pipeline, "steps", [[None, None]])[-1][1]
+                classes_fe = getattr(final_est, "classes_", np.array(["CALL", "PUT", "NEUTRAL"]))
+                proba = np.zeros(len(classes_fe), dtype=float)
+                try:
+                    idx = int(np.where(classes_fe == pred)[0][0])
+                    proba[idx] = 1.0
+                except Exception:
+                    proba = np.array([0.0, 0.0, 1.0], dtype=float)
 
-        # Obtain classes_ from pipeline or final estimator
-        classes = getattr(self.pipeline, "classes_", None)
-        if classes is None:
-            final_est = getattr(self.pipeline, "steps", [[None, None]])[-1][1]
-            classes = getattr(final_est, "classes_", np.array(["CALL", "PUT", "NEUTRAL"]))
+        # Obtain classes_ from the final estimator (canonical location)
+        final_est = getattr(self.pipeline, "steps", [[None, None]])[-1][1]
+        classes = getattr(final_est, "classes_", np.array(["CALL", "PUT", "NEUTRAL"]))
 
-        # Canonicalize probabilities into [CALL, PUT, NEUTRAL],
-        # supporting both tri-class and binary models
+        # Canonicalize probabilities into [CALL, PUT, NEUTRAL]
         probs = _probs_canonical(np.asarray(classes), np.asarray(proba))
 
         # Argmax on canonical order yields the final label
         label_idx = int(np.argmax(probs))
         label = ["CALL", "PUT", "NEUTRAL"][label_idx]
 
-        return {"movement_type": label, "probs": probs}
+        # Provide a stable float for downstream consumers (simple heuristic)
+        expected_move_pct = float(0.5 * probs[0] + 0.5 * probs[1])
 
+        return {"movement_type": label, "probs": probs, "expected_move_pct": expected_move_pct}
 
     @property
-    def feature_names(self):
+    def feature_names(self) -> List[str]:
         # derive expected feature order from pipeline safely
         try:
             steps = getattr(self.pipeline, "steps", None)
             if steps:
-                preproc = None
-                for name, step in steps:
+                for _, step in steps:
                     if hasattr(step, "get_feature_names_out"):
-                        preproc = step
-                        break
-                if preproc is not None:
-                    return list(preproc.get_feature_names_out())
+                        return list(step.get_feature_names_out())
         except Exception:
             pass
         # fallback to union of known numeric + categorical names
         return [
-            "breakout_prob","recent_move_pct","volume_ratio","rsi","corr_dev","skew_ratio",
-            "yield_spike_2year","yield_spike_10year","yield_spike_30year",
-            "delta","gamma","theta","vega","rho","vanna","vomma","charm","veta",
-            "speed","zomma","color","implied_volatility","theta_day","theta_5m",
-            "ms_spread_mean","ms_depth_imbalance_mean","ms_ofi_sum","ms_signed_volume_sum","ms_vpin",
-            "symbol","time_of_day","source"
+            "breakout_prob", "recent_move_pct", "volume_ratio", "rsi", "corr_dev", "skew_ratio",
+            "yield_spike_2year", "yield_spike_10year", "yield_spike_30year",
+            "delta", "gamma", "theta", "vega", "rho", "vanna", "vomma", "charm", "veta",
+            "speed", "zomma", "color", "implied_volatility", "theta_day", "theta_5m",
+            "ms_spread_mean", "ms_depth_imbalance_mean", "ms_ofi_sum", "ms_signed_volume_sum", "ms_vpin",
+            "symbol", "time_of_day", "source"
         ]
