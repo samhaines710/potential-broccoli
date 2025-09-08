@@ -96,9 +96,14 @@ def _load_pipeline(model_uri: str):
     write_status(f"Loading ML pipeline from {model_uri}")
     if model_uri.startswith("s3://"):
         data = _download_from_s3(model_uri)
-        pipe = joblib.load(io.BytesIO(data))
+        obj = joblib.load(io.BytesIO(data))
     else:
-        pipe = joblib.load(model_uri)
+        obj = joblib.load(model_uri)
+    # unwrap bundle if saved as dict
+    if isinstance(obj, dict) and "model" in obj:
+        pipe = obj["model"]
+    else:
+        pipe = obj
     write_status("ML pipeline loaded successfully.")
     return pipe
 
@@ -278,8 +283,8 @@ def _probs_canonical(classes: np.ndarray, proba_row: np.ndarray) -> List[float]:
 
 
 class MLClassifier:
-    def __init__(self) -> None:
-        model_uri = os.getenv("MODEL_URI", "s3://bucketbuggypie/models/xgb_classifier.pipeline.joblib")
+    def __init__(self, model_path: str | None = None) -> None:
+        model_uri = model_path or os.getenv(\"MODEL_URI\", \"s3://bucketbuggypie/models/xgb_classifier.pipeline.joblib\")
         self.pipeline = _load_pipeline(model_uri)
 
     def classify(self, features: Dict[str, Any]) -> Dict[str, Any]:
@@ -312,3 +317,29 @@ class MLClassifier:
         label = ["CALL", "PUT", "NEUTRAL"][label_idx]
 
         return {"movement_type": label, "probs": probs}
+
+
+    @property
+    def feature_names(self):
+        # derive expected feature order from pipeline safely
+        try:
+            steps = getattr(self.pipeline, "steps", None)
+            if steps:
+                preproc = None
+                for name, step in steps:
+                    if hasattr(step, "get_feature_names_out"):
+                        preproc = step
+                        break
+                if preproc is not None:
+                    return list(preproc.get_feature_names_out())
+        except Exception:
+            pass
+        # fallback to union of known numeric + categorical names
+        return [
+            "breakout_prob","recent_move_pct","volume_ratio","rsi","corr_dev","skew_ratio",
+            "yield_spike_2year","yield_spike_10year","yield_spike_30year",
+            "delta","gamma","theta","vega","rho","vanna","vomma","charm","veta",
+            "speed","zomma","color","implied_volatility","theta_day","theta_5m",
+            "ms_spread_mean","ms_depth_imbalance_mean","ms_ofi_sum","ms_signed_volume_sum","ms_vpin",
+            "symbol","time_of_day","source"
+        ]
