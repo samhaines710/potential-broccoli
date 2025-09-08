@@ -7,7 +7,7 @@ ML Classifier for movement_type prediction.
 Key hardening for NumPy 2.0 / scikit-learn OneHotEncoder:
 - Safe np.isnan shim: returns False for non-numeric/object arrays instead of raising TypeError.
 - Strict column alignment to pipeline.feature_names_in_ (if present) without boolean-evaluating arrays.
-- Deterministic filling for missing inputs (incl. categorical 'source', 'symbol', 'time_of_day').
+- Deterministic filling for missing inputs (incl. categorical 'symbol', 'source', 'time_of_day').
 - Returns both 'movement_type' and class 'probs' in [CALL, PUT, NEUTRAL] order.
 
 Environment:
@@ -256,33 +256,44 @@ def _map_class_index_to_label(classes: np.ndarray, idx: int) -> str:
 
 def _probs_canonical(classes: np.ndarray, proba_row: np.ndarray) -> List[float]:
     """
-    Map model probs → [CALL, PUT, NEUTRAL] in a robust way.
-
-    - If the model is tri-class, return the three probabilities in canonical order.
-    - If the model is binary (missing NEUTRAL), set p_neutral=0.0 and
-      renormalize [p_call, p_put] to sum to 1.0 to avoid leaking mass.
-    - If a class is missing entirely, its probability is 0.0.
+    Return probabilities in [CALL, PUT, NEUTRAL] order, robust to:
+      - binary models (2 columns) with/without NEUTRAL in classes_
+      - inconsistent classes_ vs predict_proba shape (index out of range)
+      - any missing label -> treated as 0
+    If NEUTRAL is unavailable, we renormalize CALL/PUT to sum to 1 and set NEUTRAL=0.
     """
     classes = np.asarray(classes)
+    proba = np.asarray(proba_row).ravel()
+    n = proba.shape[0]
+
+    # map label -> column index (may include NEUTRAL even if proba has only 2 cols)
     idx = {str(c).upper(): i for i, c in enumerate(classes)}
 
-    p_call = float(proba_row[idx["CALL"]]) if "CALL" in idx else 0.0
-    p_put = float(proba_row[idx["PUT"]]) if "PUT" in idx else 0.0
-    p_neu = float(proba_row[idx["NEUTRAL"]]) if "NEUTRAL" in idx else 0.0
+    def grab(label: str) -> float:
+        j = idx.get(label)
+        if j is None or j < 0 or j >= n:
+            return 0.0
+        try:
+            return float(proba[j])
+        except Exception:
+            arr = np.asarray(proba[j])
+            return float(arr.item()) if arr.size == 1 else 0.0
 
-    # If NEUTRAL is missing (typical binary model), renormalize CALL/PUT.
-    if "NEUTRAL" not in idx:
+    p_call = grab("CALL")
+    p_put = grab("PUT")
+    p_neu = grab("NEUTRAL")
+
+    neu_missing_or_oob = ("NEUTRAL" not in idx) or (idx.get("NEUTRAL", -1) >= n)
+    if neu_missing_or_oob:
         s2 = p_call + p_put
         if s2 > 0:
-            p_call, p_put = p_call / s2, p_put / s2
-        p_neu = 0.0
-        return [p_call, p_put, p_neu]
+            return [p_call / s2, p_put / s2, 0.0]
+        return [0.5, 0.5, 0.0]
 
-    # Tri-class path: soft-normalize against numeric drift
-    s = p_call + p_put + p_neu
-    if s > 0:
-        return [p_call / s, p_put / s, p_neu / s]
-    return [p_call, p_put, p_neu]
+    s3 = p_call + p_put + p_neu
+    if s3 > 0:
+        return [p_call / s3, p_put / s3, p_neu / s3]
+    return [1.0 / 3, 1.0 / 3, 1.0 / 3]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
