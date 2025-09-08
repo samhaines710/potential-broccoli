@@ -7,7 +7,7 @@ ML Classifier for movement_type prediction.
 Key hardening for NumPy 2.0 / scikit-learn OneHotEncoder:
 - Safe np.isnan shim: returns False for non-numeric/object arrays instead of raising TypeError.
 - Strict column alignment to pipeline.feature_names_in_ (if present) without boolean-evaluating arrays.
-- Deterministic filling for missing inputs (incl. categorical 'source').
+- Deterministic filling for missing inputs (incl. categorical 'source', 'symbol', 'time_of_day').
 - Returns both 'movement_type' and class 'probs' in [CALL, PUT, NEUTRAL] order.
 
 Environment:
@@ -179,6 +179,7 @@ def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFram
 
     DEFAULTS: Dict[str, Any] = {
         # categorical
+        "symbol": "UNKNOWN",
         "source": "fallback",
         "time_of_day": "MIDDAY",
         # numeric defaults
@@ -222,7 +223,7 @@ def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFram
     df = df.reindex(columns=expected)
 
     # Ensure categorical dtype→str to avoid encoder issues
-    for cat_col in ("source", "time_of_day"):
+    for cat_col in ("symbol", "source", "time_of_day"):
         if cat_col in df.columns:
             df[cat_col] = df[cat_col].astype(str)
 
