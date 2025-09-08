@@ -1,260 +1,249 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-train_ml_classifier.py
 
-Reads data/movement_training_data.csv, preprocesses numeric + categorical
-(with robust imputation), label-encodes the target, fits an XGBoost
-multi-class pipeline, evaluates, and saves the trained pipeline.
-
-Hardening:
-- Converts inf/-inf -> NaN and imputes numerics with 0.0 (avoids scaler warnings).
-- Imputes categoricals with 'fallback' and OHE(handle_unknown='ignore').
-- Safe OHE construction across sklearn versions (sparse_output vs sparse).
-- Safe feature-name extraction across sklearn versions.
-- Stratified split when possible; falls back safely if classes are imbalanced.
-- Attaches feature_names and label_encoder to the saved pipeline.
-
-Usage:
-  python train_ml_classifier.py \
-      --train-csv data/movement_training_data.csv \
-      --label-col movement_type \
-      --model-dir models \
-      --model-filename xgb_classifier.pipeline.joblib
-"""
-
-from __future__ import annotations
-
-import os
 import argparse
-import logging
-from typing import List
+import json
+import os
+import sys
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Any
 
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
-from xgboost import XGBClassifier
-
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix
+)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Logging
-# ──────────────────────────────────────────────────────────────────────────────
+NUMERIC_COLS = [
+    "breakout_prob", "recent_move_pct", "volume_ratio", "rsi", "corr_dev", "skew_ratio",
+    "yield_spike_2year", "yield_spike_10year", "yield_spike_30year",
+    "delta", "gamma", "theta", "vega", "rho", "vanna", "vomma", "charm", "veta",
+    "speed", "zomma", "color", "implied_volatility", "theta_day", "theta_5m",
+    "ms_spread_mean", "ms_depth_imbalance_mean", "ms_ofi_sum",
+    "ms_signed_volume_sum", "ms_vpin"
+]
 
-def setup_logging() -> None:
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter(
-        '{"timestamp":"%(asctime)s","level":"%(levelname)s","module":"%(module)s","message":"%(message)s"}'
-    ))
-    root.handlers.clear()
-    root.addHandler(h)
+CATEGORICAL_COLS = ["symbol", "time_of_day", "source"]
+
+TARGET_COL = os.environ.get("LABEL_COL_DEFAULT", "movement_class")  # change if your column name differs
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class TrainConfig:
+    data_csv: str
+    out_path: str
+    test_size: float = 0.2
+    random_state: int = 42
+    stratify: bool = True
 
-ORDERED_LABELS = ["CALL", "PUT", "NEUTRAL"]
 
-def _finite_numeric(df: pd.DataFrame, exclude: List[str]) -> pd.DataFrame:
-    """Convert non-categorical columns to finite (inf→NaN)."""
-    df = df.copy()
-    for col in df.columns:
-        if col in exclude:
-            continue
-        if pd.api.types.is_numeric_dtype(df[col]):
-            s = pd.to_numeric(df[col], errors="coerce")
-            s = s.replace([np.inf, -np.inf], np.nan)
-            df[col] = s
+def _log(msg: str) -> None:
+    print(json.dumps({
+        "timestamp": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3],
+        "level": "INFO",
+        "module": "train_ml_classifier",
+        "message": msg
+    }))
+
+def load_data(path: str) -> pd.DataFrame:
+    _log(f"Loading training data from {path}")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Training data not found at: {path}")
+    df = pd.read_csv(path)
+    if TARGET_COL not in df.columns:
+        raise ValueError(f"Expected target column '{TARGET_COL}' not found. Columns: {list(df.columns)}")
+
+    # coerce numeric columns safely
+    for c in NUMERIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        else:
+            _log(f"Warning: expected numeric column missing in data: {c}")
+
+    # basic sanitization
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
     return df
 
-def _ohe_ctor() -> OneHotEncoder:
-    """
-    Construct OneHotEncoder compatibly across sklearn versions.
-    - sklearn >= 1.2: OneHotEncoder(..., sparse_output=False)
-    - older:           OneHotEncoder(..., sparse=False)
-    """
-    try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
-def _ohe_feature_names(ohe: OneHotEncoder, cat_cols: List[str]) -> List[str]:
-    """Get OHE output feature names across sklearn versions."""
-    try:
-        return list(ohe.get_feature_names_out(cat_cols))
-    except Exception:
-        return list(ohe.get_feature_names(cat_cols))  # type: ignore[attr-defined]
+def make_pipeline() -> Pipeline:
+    _log(f"Numeric cols: {NUMERIC_COLS}")
+    _log(f"Categorical cols: {CATEGORICAL_COLS}")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Training
-# ──────────────────────────────────────────────────────────────────────────────
-
-def train(
-    train_csv: str,
-    label_col: str,
-    model_dir: str,
-    model_filename: str,
-    test_size: float,
-    random_state: int,
-) -> None:
-    logger = logging.getLogger(__name__)
-    logger.info(f"Loading training data from {train_csv}")
-
-    df = pd.read_csv(train_csv)
-
-    if label_col not in df.columns:
-        raise ValueError(f"Label column '{label_col}' not found in {train_csv}")
-
-    # Optional: Drop columns that should never be features
-    drop_cols = []
-    # If symbol is overly sparse/high-cardinality for your use-case, drop it:
-    # drop_cols.append("symbol")
-    if drop_cols:
-        df = df.drop(columns=[c for c in drop_cols if c in df.columns])
-
-    # Ensure finite numerics before we compute dtypes and split
-    df = _finite_numeric(df, exclude=[label_col])
-
-    # Encode target with stable ordering if present; otherwise default LE order
-    y_raw = df[label_col].astype(str)
-    if all(lbl in set(y_raw.unique()) for lbl in ORDERED_LABELS):
-        # map to ordered integers explicitly
-        mapping = {k: i for i, k in enumerate(ORDERED_LABELS)}
-        y_enc = y_raw.map(mapping).to_numpy()
-        classes_out = ORDERED_LABELS
-    else:
-        le = LabelEncoder()
-        y_enc = le.fit_transform(y_raw)
-        classes_out = list(le.classes_)
-
-    X = df.drop(columns=[label_col])
-
-    # Identify numeric vs. categorical columns after coercion
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
-
-    logger.info(f"Numeric cols: {num_cols}")
-    logger.info(f"Categorical cols: {cat_cols}")
-
-    # Preprocessor: numeric -> impute(0) -> scale ; categorical -> impute('fallback') -> OHE
-    numeric_pipe = Pipeline(steps=[
-        ("imp", SimpleImputer(strategy="constant", fill_value=0.0)),
-        ("scaler", StandardScaler(with_mean=True, with_std=True)),
+    numeric_tf = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
     ])
 
-    categorical_pipe = Pipeline(steps=[
-        ("imp", SimpleImputer(strategy="constant", fill_value="fallback")),
-        ("ohe", _ohe_ctor()),
+    categorical_tf = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("ohe", OneHotEncoder(handle_unknown="ignore"))
     ])
 
-    preprocessor = ColumnTransformer(
+    preproc = ColumnTransformer(
         transformers=[
-            ("num", numeric_pipe, num_cols),
-            ("cat", categorical_pipe, cat_cols),
+            ("num", numeric_tf, [c for c in NUMERIC_COLS if c]),
+            ("cat", categorical_tf, [c for c in CATEGORICAL_COLS if c and c != TARGET_COL]),
         ],
         remainder="drop",
+        n_jobs=None,
+        verbose_feature_names_out=False
     )
 
-    # XGBoost multi-class classifier
-    clf = XGBClassifier(
-        n_estimators=400,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        objective="multi:softprob",
-        eval_metric="mlogloss",
-        num_class=3,            # CALL, PUT, NEUTRAL
-        tree_method="hist",
-        random_state=random_state,
+    clf = RandomForestClassifier(
+        n_estimators=500,
+        max_depth=12,
+        n_jobs=-1,
+        class_weight="balanced",
+        random_state=42
     )
 
     pipeline = Pipeline(steps=[
-        ("pre", preprocessor),
-        ("xgb", clf),
+        ("preproc", preproc),
+        ("clf", clf)
     ])
+    return pipeline
 
-    # Stratified split if possible; otherwise fallback
-    unique, counts = np.unique(y_enc, return_counts=True)
-    can_stratify = (len(unique) >= 2) and np.all(counts >= 2)
-    logger.info(f"Stratified split: {'yes' if can_stratify else 'no'} "
-                f"(classes={dict(zip(unique.tolist(), counts.tolist()))})")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y_enc,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y_enc if can_stratify else None,
+def stratified_split(X: pd.DataFrame, y: np.ndarray, cfg: TrainConfig):
+    stratify = y if cfg.stratify else None
+    class_counts = {int(k): int(v) for k, v in pd.Series(y).value_counts().sort_index().to_dict().items()}
+    _log(f"Stratified split: {'yes' if stratify is not None else 'no'} (classes={class_counts})")
+    return train_test_split(
+        X, y,
+        test_size=cfg.test_size,
+        random_state=cfg.random_state,
+        stratify=stratify
     )
 
-    logger.info("Fitting pipeline on training data")
+
+def fit_and_validate(pipeline: Pipeline, X_train, y_train, X_val, y_val) -> Dict[str, Any]:
+    _log("Fitting pipeline on training data")
     pipeline.fit(X_train, y_train)
 
-    # Evaluate
-    y_pred_enc = pipeline.predict(X_test)
-    acc = accuracy_score(y_test, y_pred_enc)
-    logger.info(f"Validation Accuracy: {acc:.4f}")
+    y_pred = pipeline.predict(X_val)
+    acc = accuracy_score(y_val, y_pred)
+    _log(f"Validation Accuracy: {acc:.4f}")
 
-    # Attach metadata: feature names + label encoder semantics
-    # Extract numeric names (as-is) and categorical OHE names
-    num_names = num_cols
-    ohe = pipeline.named_steps["pre"].named_transformers_["cat"].named_steps["ohe"]
-    cat_names = _ohe_feature_names(ohe, cat_cols) if cat_cols else []
-    feature_names = num_names + cat_names
+    report = classification_report(y_val, y_pred, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_val, y_pred)
 
-    # Attach for downstream consumers
-    pipeline.feature_names = feature_names                 # type: ignore[attr-defined]
-    pipeline.classes_ = np.array(classes_out)              # type: ignore[attr-defined]
-    # For compatibility with your runtime classifier, also include a LabelEncoder-like object when applicable
+    metrics = {
+        "accuracy": acc,
+        "classification_report": report,
+        "confusion_matrix": cm.tolist()
+    }
+
+    # Try to log top importances if available (RandomForest has feature_importances_)
     try:
-        le = LabelEncoder()
-        le.fit(classes_out)
-        pipeline.label_encoder = le                        # type: ignore[attr-defined]
-    except Exception:
-        pass
+        clf = pipeline.named_steps["clf"]
+        importances = getattr(clf, "feature_importances_", None)
+        if importances is not None:
+            preproc = pipeline.named_steps["preproc"]
+            feature_names = preproc.get_feature_names_out()
+            fi = sorted(
+                zip(feature_names, importances),
+                key=lambda t: t[1],
+                reverse=True
+            )[:30]
+            metrics["top_feature_importances"] = fi
+    except Exception as e:
+        _log(f"Feature importance unavailable: {e}")
 
-    logger.info(f"Attached {len(feature_names)} feature names + label encoder/classes")
-
-    # Save
-    os.makedirs(model_dir, exist_ok=True)
-    out_path = os.path.join(model_dir, model_filename)
-    joblib.dump(pipeline, out_path)
-    logger.info(f"✅ Trained pipeline saved to {out_path}")
+    return metrics
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────────────
+def save_artifact(out_path: str, pipeline: Pipeline, label_encoder: LabelEncoder, metrics: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--train-csv",      default="data/movement_training_data.csv")
-    p.add_argument("--label-col",      default="movement_type")
-    p.add_argument("--model-dir",      default="models")
-    p.add_argument("--model-filename", default="xgb_classifier.pipeline.joblib")
-    p.add_argument("--test-size",      type=float, default=0.25)
-    p.add_argument("--random-state",   type=int,   default=42)
-    return p.parse_args()
+    bundle = {
+        "model": pipeline,
+        "classes": pipeline.named_steps["clf"].classes_.tolist(),
+        "label_encoder_classes": label_encoder.classes_.tolist(),
+        "sklearn_version": __import__("sklearn").__version__,
+        "metrics": metrics
+    }
+    joblib.dump(bundle, out_path)
+    _log(f"Saved model bundle to {out_path}")
+
+
+def train(cfg: TrainConfig) -> None:
+    df = load_data(cfg.data_csv)
+
+    missing = [c for c in (NUMERIC_COLS + CATEGORICAL_COLS + [TARGET_COL]) if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    y_raw = df[TARGET_COL].astype(str).values
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(y_raw)
+
+    X = df[NUMERIC_COLS + CATEGORICAL_COLS].copy()
+
+    X_train, X_val, y_train, y_val = stratified_split(X, y, cfg)
+
+    pipeline = make_pipeline()
+    metrics = fit_and_validate(pipeline, X_train, y_train, X_val, y_val)
+
+    save_artifact(cfg.out_path, pipeline, label_encoder, metrics)
+
+    print("\n=== VALIDATION METRICS ===")
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print("Confusion Matrix (rows=true, cols=pred):")
+    print(np.array(metrics["confusion_matrix"]))
+
+
+def parse_args(argv: List[str]) -> TrainConfig:
+    p = argparse.ArgumentParser(description="Train movement classifier")
+    # New-style
+    p.add_argument("--data", default="data/movement_training_data.csv", help="Path to CSV")
+    p.add_argument("--out", default="Resources/xgb_classifier.pipeline.joblib", help="Output model bundle path")
+    p.add_argument("--test-size", type=float, default=0.2)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--no-stratify", action="store_true")
+    # Legacy CI aliases
+    p.add_argument("--train-csv", dest="legacy_data", default=None, help="(legacy) training CSV path")
+    p.add_argument("--label-col", dest="label_col", default=None, help="(legacy) label column name")
+    p.add_argument("--model-dir", dest="model_dir", default=None, help="(legacy) output directory")
+    p.add_argument("--model-filename", dest="model_filename", default=None, help="(legacy) output filename")
+    args = p.parse_args(argv)
+
+    data_path = args.data if args.legacy_data is None else args.legacy_data
+    out_path = args.out
+    if args.model_dir or args.model_filename:
+        md = args.model_dir or ""
+        mf = args.model_filename or "xgb_classifier.pipeline.joblib"
+        out_path = os.path.join(md, mf)
+
+    # Allow overriding label column for backward compatibility
+    global TARGET_COL
+    if args.label_col:
+        TARGET_COL = args.label_col
+
+    return TrainConfig(
+        data_csv=data_path,
+        out_path=out_path,
+        test_size=args.test_size,
+        random_state=args.seed,
+        stratify=not args.no_stratify
+    )
+        data_csv=args.data,
+        out_path=args.out,
+        test_size=args.test_size,
+        random_state=args.seed,
+        stratify=not args.no_stratify
+    )
 
 
 if __name__ == "__main__":
-    setup_logging()
-    args = parse_args()
-    train(
-        train_csv=args.train_csv,
-        label_col=args.label_col,
-        model_dir=args.model_dir,
-        model_filename=args.model_filename,
-        test_size=args.test_size,
-        random_state=args.random_state,
-    )
+    cfg = parse_args(sys.argv[1:])
+    train(cfg)
