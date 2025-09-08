@@ -6,23 +6,21 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any
+from typing import List, Dict, Any
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix
-)
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
 
+# Default label column; can be overridden by --label-col or env LABEL_COL_DEFAULT
+TARGET_COL = os.environ.get("LABEL_COL_DEFAULT", "movement_class")
 
 NUMERIC_COLS = [
     "breakout_prob", "recent_move_pct", "volume_ratio", "rsi", "corr_dev", "skew_ratio",
@@ -32,10 +30,7 @@ NUMERIC_COLS = [
     "ms_spread_mean", "ms_depth_imbalance_mean", "ms_ofi_sum",
     "ms_signed_volume_sum", "ms_vpin"
 ]
-
 CATEGORICAL_COLS = ["symbol", "time_of_day", "source"]
-
-TARGET_COL = os.environ.get("LABEL_COL_DEFAULT", "movement_class")  # change if your column name differs
 
 
 @dataclass
@@ -55,11 +50,13 @@ def _log(msg: str) -> None:
         "message": msg
     }))
 
+
 def load_data(path: str) -> pd.DataFrame:
     _log(f"Loading training data from {path}")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Training data not found at: {path}")
     df = pd.read_csv(path)
+
     if TARGET_COL not in df.columns:
         raise ValueError(f"Expected target column '{TARGET_COL}' not found. Columns: {list(df.columns)}")
 
@@ -95,7 +92,6 @@ def make_pipeline() -> Pipeline:
             ("cat", categorical_tf, [c for c in CATEGORICAL_COLS if c and c != TARGET_COL]),
         ],
         remainder="drop",
-        n_jobs=None,
         verbose_feature_names_out=False
     )
 
@@ -107,23 +103,14 @@ def make_pipeline() -> Pipeline:
         random_state=42
     )
 
-    pipeline = Pipeline(steps=[
-        ("preproc", preproc),
-        ("clf", clf)
-    ])
-    return pipeline
+    return Pipeline(steps=[("preproc", preproc), ("clf", clf)])
 
 
 def stratified_split(X: pd.DataFrame, y: np.ndarray, cfg: TrainConfig):
     stratify = y if cfg.stratify else None
     class_counts = {int(k): int(v) for k, v in pd.Series(y).value_counts().sort_index().to_dict().items()}
     _log(f"Stratified split: {'yes' if stratify is not None else 'no'} (classes={class_counts})")
-    return train_test_split(
-        X, y,
-        test_size=cfg.test_size,
-        random_state=cfg.random_state,
-        stratify=stratify
-    )
+    return train_test_split(X, y, test_size=cfg.test_size, random_state=cfg.random_state, stratify=stratify)
 
 
 def fit_and_validate(pipeline: Pipeline, X_train, y_train, X_val, y_val) -> Dict[str, Any]:
@@ -143,19 +130,15 @@ def fit_and_validate(pipeline: Pipeline, X_train, y_train, X_val, y_val) -> Dict
         "confusion_matrix": cm.tolist()
     }
 
-    # Try to log top importances if available (RandomForest has feature_importances_)
+    # Feature importances if available
     try:
         clf = pipeline.named_steps["clf"]
         importances = getattr(clf, "feature_importances_", None)
         if importances is not None:
             preproc = pipeline.named_steps["preproc"]
             feature_names = preproc.get_feature_names_out()
-            fi = sorted(
-                zip(feature_names, importances),
-                key=lambda t: t[1],
-                reverse=True
-            )[:30]
-            metrics["top_feature_importances"] = fi
+            top = sorted(zip(feature_names, importances), key=lambda t: t[1], reverse=True)[:30]
+            metrics["top_feature_importances"] = top
     except Exception as e:
         _log(f"Feature importance unavailable: {e}")
 
@@ -164,7 +147,6 @@ def fit_and_validate(pipeline: Pipeline, X_train, y_train, X_val, y_val) -> Dict
 
 def save_artifact(out_path: str, pipeline: Pipeline, label_encoder: LabelEncoder, metrics: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
     bundle = {
         "model": pipeline,
         "classes": pipeline.named_steps["clf"].classes_.tolist(),
@@ -179,10 +161,12 @@ def save_artifact(out_path: str, pipeline: Pipeline, label_encoder: LabelEncoder
 def train(cfg: TrainConfig) -> None:
     df = load_data(cfg.data_csv)
 
+    # Check columns exist
     missing = [c for c in (NUMERIC_COLS + CATEGORICAL_COLS + [TARGET_COL]) if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
+    # Encode target
     y_raw = df[TARGET_COL].astype(str).values
     label_encoder = LabelEncoder()
     y = label_encoder.fit_transform(y_raw)
@@ -196,6 +180,7 @@ def train(cfg: TrainConfig) -> None:
 
     save_artifact(cfg.out_path, pipeline, label_encoder, metrics)
 
+    # Terminal metrics for CI logs
     print("\n=== VALIDATION METRICS ===")
     print(f"Accuracy: {metrics['accuracy']:.4f}")
     print("Confusion Matrix (rows=true, cols=pred):")
@@ -204,19 +189,21 @@ def train(cfg: TrainConfig) -> None:
 
 def parse_args(argv: List[str]) -> TrainConfig:
     p = argparse.ArgumentParser(description="Train movement classifier")
-    # New-style
+    # New-style args
     p.add_argument("--data", default="data/movement_training_data.csv", help="Path to CSV")
     p.add_argument("--out", default="Resources/xgb_classifier.pipeline.joblib", help="Output model bundle path")
     p.add_argument("--test-size", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no-stratify", action="store_true")
-    # Legacy CI aliases
+    # Legacy CI aliases (kept for backward compatibility)
     p.add_argument("--train-csv", dest="legacy_data", default=None, help="(legacy) training CSV path")
     p.add_argument("--label-col", dest="label_col", default=None, help="(legacy) label column name")
     p.add_argument("--model-dir", dest="model_dir", default=None, help="(legacy) output directory")
     p.add_argument("--model-filename", dest="model_filename", default=None, help="(legacy) output filename")
+
     args = p.parse_args(argv)
 
+    # Resolve paths/flags
     data_path = args.data if args.legacy_data is None else args.legacy_data
     out_path = args.out
     if args.model_dir or args.model_filename:
@@ -224,7 +211,7 @@ def parse_args(argv: List[str]) -> TrainConfig:
         mf = args.model_filename or "xgb_classifier.pipeline.joblib"
         out_path = os.path.join(md, mf)
 
-    # Allow overriding label column for backward compatibility
+    # Allow overriding label column (legacy)
     global TARGET_COL
     if args.label_col:
         TARGET_COL = args.label_col
@@ -232,12 +219,6 @@ def parse_args(argv: List[str]) -> TrainConfig:
     return TrainConfig(
         data_csv=data_path,
         out_path=out_path,
-        test_size=args.test_size,
-        random_state=args.seed,
-        stratify=not args.no_stratify
-    )
-        data_csv=args.data,
-        out_path=args.out,
         test_size=args.test_size,
         random_state=args.seed,
         stratify=not args.no_stratify
