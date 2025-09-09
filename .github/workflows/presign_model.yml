@@ -1,0 +1,72 @@
+name: Presign Existing Model (no-train)
+
+on:
+  workflow_dispatch:
+    inputs:
+      object_key:
+        description: "Optional: full S3 key to presign (if blank, pick most recent under PREFIX)"
+        required: false
+        default: ""
+
+env:
+  AWS_REGION: eu-north-1
+  BUCKET: tinabobina
+  PREFIX: models/movement-classifier
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  presign:
+    runs-on: ubuntu-latest
+    outputs:
+      s3_uri: ${{ steps.do.outputs.s3_uri }}
+      presigned_url: ${{ steps.do.outputs.presigned_url }}
+
+    steps:
+      - name: Checkout (needed for OIDC context only)
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::719070647059:role/tigermoon
+          role-session-name: tinabobina-presign
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Presign latest (or specified) object
+        id: do
+        env:
+          IN_KEY: ${{ inputs.object_key }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${IN_KEY}" ]]; then
+            KEY="${IN_KEY}"
+          else
+            # Find most recent object under prefix
+            KEY="$(aws s3api list-objects-v2 \
+              --bucket "${BUCKET}" --prefix "${PREFIX}/" \
+              --query 'reverse(sort_by(Contents,&LastModified))[0].Key' \
+              --output text)"
+            if [[ "${KEY}" == "None" || -z "${KEY}" ]]; then
+              echo "No objects found at s3://${BUCKET}/${PREFIX}/" >&2
+              exit 1
+            fi
+          fi
+
+          URI="s3://${BUCKET}/${KEY}"
+          echo "Using object: ${URI}"
+          # sanity check
+          aws s3api head-object --bucket "${BUCKET}" --key "${KEY}" >/dev/null
+
+          # Presign for 7 days (604800s). Works with SSE-S3; with SSE-KMS it also works as long as the role can read.
+          URL="$(aws s3 presign "${URI}" --expires-in 604800)"
+
+          echo "s3_uri=${URI}"        >> "$GITHUB_OUTPUT"
+          echo "presigned_url=${URL}" >> "$GITHUB_OUTPUT"
+
+          echo "S3 URI: ${URI}"
+          echo "Presigned URL (paste into QuantConnect):"
+          echo "${URL}"
