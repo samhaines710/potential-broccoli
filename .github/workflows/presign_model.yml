@@ -4,14 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       object_key:
-        description: "Optional: full S3 key to presign (if blank, pick most recent under PREFIX)"
+        description: "Optional: full S3 object key to presign (e.g., models/xgb_classifier.pipeline.joblib). Leave blank to pick the latest under PREFIX."
         required: false
         default: ""
+      prefix:
+        description: "S3 prefix to search when object_key is blank."
+        required: false
+        default: "models"
+      expires_in:
+        description: "Presigned URL TTL in seconds (max 604800 = 7 days)."
+        required: false
+        default: "604800"
 
 env:
   AWS_REGION: eu-north-1
   BUCKET: tinabobina
-  PREFIX: models/movement-classifier
 
 permissions:
   id-token: write
@@ -21,52 +28,98 @@ jobs:
   presign:
     runs-on: ubuntu-latest
     outputs:
-      s3_uri: ${{ steps.do.outputs.s3_uri }}
-      presigned_url: ${{ steps.do.outputs.presigned_url }}
+      s3_uri: ${{ steps.presign.outputs.s3_uri }}
+      presigned_url: ${{ steps.presign.outputs.presigned_url }}
 
     steps:
-      - name: Checkout (needed for OIDC context only)
+      - name: Checkout (for OIDC context only)
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::719070647059:role/tigermoon
           role-session-name: tinabobina-presign
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Presign latest (or specified) object
-        id: do
+      - name: Presign latest (or specified) object (safe)
+        id: presign
         env:
           IN_KEY: ${{ inputs.object_key }}
+          BUCKET: ${{ env.BUCKET }}
+          PREFIX: ${{ inputs.prefix }}
+          EXPIRES: ${{ inputs.expires_in }}
         run: |
           set -euo pipefail
 
+          # 1) Resolve the key safely (no jq, no JMESPath sort_by on null)
           if [[ -n "${IN_KEY}" ]]; then
             KEY="${IN_KEY}"
           else
-            # Find most recent object under prefix
-            KEY="$(aws s3api list-objects-v2 \
-              --bucket "${BUCKET}" --prefix "${PREFIX}/" \
-              --query 'reverse(sort_by(Contents,&LastModified))[0].Key' \
-              --output text)"
-            if [[ "${KEY}" == "None" || -z "${KEY}" ]]; then
-              echo "No objects found at s3://${BUCKET}/${PREFIX}/" >&2
+            echo "Finding latest object under s3://${BUCKET}/${PREFIX%/}/ ..."
+            KEY="$(
+              python - <<'PY'
+import json, os, subprocess, sys
+bucket = os.environ["BUCKET"]
+prefix = os.environ["PREFIX"].rstrip("/") + "/"
+# List objects; may be empty
+res = subprocess.run(
+    ["aws","s3api","list-objects-v2","--bucket",bucket,"--prefix",prefix,"--output","json"],
+    capture_output=True, text=True, check=True
+)
+data = json.loads(res.stdout or "{}")
+contents = data.get("Contents") or []
+if not contents:
+    # Nothing found; exit with no key so shell can error cleanly with a helpful message.
+    sys.exit(0)
+latest = max(contents, key=lambda o: o["LastModified"])
+print(latest["Key"])
+PY
+            )"
+            if [[ -z "${KEY:-}" ]]; then
+              echo "No objects found at s3://${BUCKET}/${PREFIX%/}/" >&2
+              echo "Tip: upload a model first or re-run with 'object_key' set to an exact key." >&2
               exit 1
             fi
           fi
 
           URI="s3://${BUCKET}/${KEY}"
           echo "Using object: ${URI}"
-          # sanity check
+
+          # 2) Sanity check existence
           aws s3api head-object --bucket "${BUCKET}" --key "${KEY}" >/dev/null
 
-          # Presign for 7 days (604800s). Works with SSE-S3; with SSE-KMS it also works as long as the role can read.
-          URL="$(aws s3 presign "${URI}" --expires-in 604800)"
+          # 3) Bounds-check TTL (AWS max ~604800)
+          if [[ "${EXPIRES}" -gt 604800 ]]; then
+            echo "Requested expires_in=${EXPIRES} > 604800; clamping to 604800." >&2
+            EXPIRES=604800
+          fi
 
-          echo "s3_uri=${URI}"        >> "$GITHUB_OUTPUT"
-          echo "presigned_url=${URL}" >> "$GITHUB_OUTPUT"
+          # 4) Presign
+          URL="$(aws s3 presign "${URI}" --expires-in "${EXPIRES}")"
+
+          # 5) Emit outputs
+          {
+            echo "s3_uri=${URI}"
+            echo "presigned_url=${URL}"
+          } >> "$GITHUB_OUTPUT"
 
           echo "S3 URI: ${URI}"
           echo "Presigned URL (paste into QuantConnect):"
           echo "${URL}"
+
+      - name: (Optional) Save URL as artifact
+        if: always()
+        run: |
+          echo "${{ steps.presign.outputs.s3_uri }}" > s3_uri.txt
+          echo "${{ steps.presign.outputs.presigned_url }}" > presigned_url.txt
+        shell: bash
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: presigned-model-url
+          path: |
+            s3_uri.txt
+            presigned_url.txt
