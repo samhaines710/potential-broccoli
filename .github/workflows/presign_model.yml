@@ -4,15 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       object_key:
-        description: "Optional: full S3 object key to presign (e.g., models/xgb_classifier.pipeline.joblib). Leave blank to pick the latest under PREFIX."
-        required: false
-        default: ""
-      prefix:
-        description: "S3 prefix to search when object_key is blank."
-        required: false
-        default: "models"
+        description: "Full S3 object key to presign (e.g., models/xgb_classifier.pipeline.joblib)"
+        required: true
+        default: "models/xgb_classifier.pipeline.joblib"
       expires_in:
-        description: "Presigned URL TTL in seconds (max 604800 = 7 days)."
+        description: "TTL seconds (max 604800 = 7 days)"
         required: false
         default: "604800"
 
@@ -42,81 +38,47 @@ jobs:
           role-session-name: tinabobina-presign
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Presign latest (or specified) object (safe)
+      - name: Presign specified object
         id: presign
         env:
           IN_KEY: ${{ inputs.object_key }}
-          BUCKET: ${{ env.BUCKET }}
-          PREFIX: ${{ inputs.prefix }}
           EXPIRES: ${{ inputs.expires_in }}
+          BUCKET: ${{ env.BUCKET }}
         run: |
           set -euo pipefail
-
-          # 1) Resolve the key safely
-          if [[ -n "${IN_KEY}" ]]; then
-            KEY="${IN_KEY}"
-          else
-            echo "Finding latest object under s3://${BUCKET}/${PREFIX%/}/ ..."
-            KEY="$(
-              python - <<'PY'
-import json, os, subprocess, sys
-bucket = os.environ["BUCKET"]
-prefix = os.environ["PREFIX"].rstrip("/") + "/"
-res = subprocess.run(
-    ["aws","s3api","list-objects-v2","--bucket",bucket,"--prefix",prefix,"--output","json"],
-    capture_output=True, text=True, check=True
-)
-data = json.loads(res.stdout or "{}")
-contents = data.get("Contents") or []
-if not contents:
-    sys.exit(0)  # no objects -> KEY empty -> friendly error below
-latest = max(contents, key=lambda o: o["LastModified"])
-print(latest["Key"])
-PY
-            )"
-            if [[ -z "${KEY:-}" ]]; then
-              echo "No objects found at s3://${BUCKET}/${PREFIX%/}/" >&2
-              echo "Tip: upload a model first or re-run with 'object_key' set to an exact key (e.g., models/xgb_classifier.pipeline.joblib)." >&2
-              exit 1
-            fi
+          if [[ -z "${IN_KEY}" ]]; then
+            echo "Input 'object_key' is required." >&2
+            exit 1
           fi
 
-          URI="s3://${BUCKET}/${KEY}"
-          echo "Using object: ${URI}"
+          # sanity check object exists
+          aws s3api head-object --bucket "${BUCKET}" --key "${IN_KEY}" >/dev/null
 
-          # 2) Ensure it exists
-          aws s3api head-object --bucket "${BUCKET}" --key "${KEY}" >/dev/null
+          # clamp TTL to 7 days
+          if [[ "${EXPIRES}" -gt 604800 ]]; then EXPIRES=604800; fi
 
-          # 3) Clamp TTL
-          if [[ "${EXPIRES}" -gt 604800 ]]; then
-            echo "Requested expires_in=${EXPIRES} > 604800; clamping to 604800." >&2
-            EXPIRES=604800
-          fi
-
-          # 4) Presign
+          URI="s3://${BUCKET}/${IN_KEY}"
           URL="$(aws s3 presign "${URI}" --expires-in "${EXPIRES}")"
 
-          # 5) Emit outputs
-          {
-            echo "s3_uri=${URI}"
-            echo "presigned_url=${URL}"
-          } >> "$GITHUB_OUTPUT"
+          echo "s3_uri=${URI}"        >> "$GITHUB_OUTPUT"
+          echo "presigned_url=${URL}" >> "$GITHUB_OUTPUT"
 
           echo "S3 URI: ${URI}"
           echo "Presigned URL (paste into QuantConnect):"
           echo "${URL}"
 
-      - name: (Optional) Save URL as artifact
-        if: ${{ always() }}
-        run: |
-          echo "${{ steps.presign.outputs.s3_uri }}" > s3_uri.txt
-          echo "${{ steps.presign.outputs.presigned_url }}" > presigned_url.txt
-
-      - name: Upload artifact
+      - name: Upload URL artifact
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: presigned-model-url
           path: |
-            s3_uri.txt
-            presigned_url.txt
+            ${{ github.workspace }}/s3_uri.txt
+            ${{ github.workspace }}/presigned_url.txt
+        continue-on-error: true
+
+      - name: Write URL files (best-effort)
+        if: ${{ always() }}
+        run: |
+          echo "${{ steps.presign.outputs.s3_uri }}" > s3_uri.txt || true
+          echo "${{ steps.presign.outputs.presigned_url }}" > presigned_url.txt || true
