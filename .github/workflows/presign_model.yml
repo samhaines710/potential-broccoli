@@ -46,6 +46,7 @@ jobs:
           BUCKET: ${{ env.BUCKET }}
         run: |
           set -euo pipefail
+
           if [[ -z "${IN_KEY}" ]]; then
             echo "Input 'object_key' is required." >&2
             exit 1
@@ -67,18 +68,31 @@ jobs:
           echo "Presigned URL (paste into QuantConnect):"
           echo "${URL}"
 
+      - name: Write URL files and job summary
+        if: ${{ always() }}
+        run: |
+          echo "${{ steps.presign.outputs.s3_uri }}" > s3_uri.txt || true
+          echo "${{ steps.presign.outputs.presigned_url }}" > presigned_url.txt || true
+
+          {
+            echo "### Model download links"
+            echo ""
+            echo "- **S3 URI**"
+            echo ""
+            echo "  \`${{ steps.presign.outputs.s3_uri }}\`"
+            echo ""
+            echo "#### Presigned URL (paste into QuantConnect)"
+            echo ""
+            echo '```'
+            echo "${{ steps.presign.outputs.presigned_url }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload URL artifact
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: presigned-model-url
           path: |
-            ${{ github.workspace }}/s3_uri.txt
-            ${{ github.workspace }}/presigned_url.txt
-        continue-on-error: true
-
-      - name: Write URL files (best-effort)
-        if: ${{ always() }}
-        run: |
-          echo "${{ steps.presign.outputs.s3_uri }}" > s3_uri.txt || true
-          echo "${{ steps.presign.outputs.presigned_url }}" > presigned_url.txt || true
+            s3_uri.txt
+            presigned_url.txt
