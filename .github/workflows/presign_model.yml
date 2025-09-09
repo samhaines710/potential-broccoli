@@ -8,9 +8,9 @@ on:
         required: true
         default: "models/xgb_classifier.pipeline.joblib"
       expires_in:
-        description: "TTL seconds (max 604800 = 7 days)"
+        description: "TTL seconds for the presigned URL (must be <= role session); try 21600 (6h)"
         required: false
-        default: "604800"
+        default: "21600"
 
 env:
   AWS_REGION: eu-north-1
@@ -37,12 +37,14 @@ jobs:
           role-to-assume: arn:aws:iam::719070647059:role/tigermoon
           role-session-name: tinabobina-presign
           aws-region: ${{ env.AWS_REGION }}
+          # IMPORTANT: URL lifetime is bounded by this session TTL
+          role-duration-seconds: 21600 # 6 hours
 
       - name: Presign specified object
         id: presign
         env:
           IN_KEY: ${{ inputs.object_key }}
-          EXPIRES: ${{ inputs.expires_in }}
+          EXPIRES_IN: ${{ inputs.expires_in }}
           BUCKET: ${{ env.BUCKET }}
         run: |
           set -euo pipefail
@@ -55,11 +57,24 @@ jobs:
           # sanity check object exists
           aws s3api head-object --bucket "${BUCKET}" --key "${IN_KEY}" >/dev/null
 
-          # clamp TTL to 7 days
+          # Clamp TTL to be <= session TTL (we set session to 21600s above)
+          EXPIRES="${EXPIRES_IN:-21600}"
+          if [[ "${EXPIRES}" -gt 21600 ]]; then
+            echo "Requested expires_in=${EXPIRES} > session(21600); clamping to 21600." >&2
+            EXPIRES=21600
+          fi
           if [[ "${EXPIRES}" -gt 604800 ]]; then EXPIRES=604800; fi
 
           URI="s3://${BUCKET}/${IN_KEY}"
           URL="$(aws s3 presign "${URI}" --expires-in "${EXPIRES}")"
+
+          # HEAD-validate from runner (fail fast if blocked/invalid)
+          code=$(curl -sSI -o /dev/null -w "%{http_code}" --max-time 20 "${URL}" || true)
+          if [[ "${code}" != "200" ]]; then
+            echo "Presigned URL is not directly reachable (HEAD HTTP ${code})." >&2
+            echo "Check bucket policy / object encryption / region or retry." >&2
+            exit 1
+          fi
 
           echo "s3_uri=${URI}"        >> "$GITHUB_OUTPUT"
           echo "presigned_url=${URL}" >> "$GITHUB_OUTPUT"
@@ -86,6 +101,8 @@ jobs:
             echo '```'
             echo "${{ steps.presign.outputs.presigned_url }}"
             echo '```'
+            echo ""
+            echo "_Note: Valid for ≤ role session (6h here). Regenerate as needed._"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload URL artifact
