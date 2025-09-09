@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1) Resolve the key safely (no jq, no JMESPath sort_by on null)
+          # 1) Resolve the key safely
           if [[ -n "${IN_KEY}" ]]; then
             KEY="${IN_KEY}"
           else
@@ -62,7 +62,6 @@ jobs:
 import json, os, subprocess, sys
 bucket = os.environ["BUCKET"]
 prefix = os.environ["PREFIX"].rstrip("/") + "/"
-# List objects; may be empty
 res = subprocess.run(
     ["aws","s3api","list-objects-v2","--bucket",bucket,"--prefix",prefix,"--output","json"],
     capture_output=True, text=True, check=True
@@ -70,15 +69,14 @@ res = subprocess.run(
 data = json.loads(res.stdout or "{}")
 contents = data.get("Contents") or []
 if not contents:
-    # Nothing found; exit with no key so shell can error cleanly with a helpful message.
-    sys.exit(0)
+    sys.exit(0)  # no objects -> KEY empty -> friendly error below
 latest = max(contents, key=lambda o: o["LastModified"])
 print(latest["Key"])
 PY
             )"
             if [[ -z "${KEY:-}" ]]; then
               echo "No objects found at s3://${BUCKET}/${PREFIX%/}/" >&2
-              echo "Tip: upload a model first or re-run with 'object_key' set to an exact key." >&2
+              echo "Tip: upload a model first or re-run with 'object_key' set to an exact key (e.g., models/xgb_classifier.pipeline.joblib)." >&2
               exit 1
             fi
           fi
@@ -86,10 +84,10 @@ PY
           URI="s3://${BUCKET}/${KEY}"
           echo "Using object: ${URI}"
 
-          # 2) Sanity check existence
+          # 2) Ensure it exists
           aws s3api head-object --bucket "${BUCKET}" --key "${KEY}" >/dev/null
 
-          # 3) Bounds-check TTL (AWS max ~604800)
+          # 3) Clamp TTL
           if [[ "${EXPIRES}" -gt 604800 ]]; then
             echo "Requested expires_in=${EXPIRES} > 604800; clamping to 604800." >&2
             EXPIRES=604800
@@ -109,14 +107,13 @@ PY
           echo "${URL}"
 
       - name: (Optional) Save URL as artifact
-        if: always()
+        if: ${{ always() }}
         run: |
           echo "${{ steps.presign.outputs.s3_uri }}" > s3_uri.txt
           echo "${{ steps.presign.outputs.presigned_url }}" > presigned_url.txt
-        shell: bash
 
       - name: Upload artifact
-        if: always()
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: presigned-model-url
