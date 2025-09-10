@@ -1,0 +1,79 @@
+name: Presign Existing Model (multipart)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  split-and-presign:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: eu-north-1
+      MODEL_S3_URI: s3://tinabobina/models/xgb_classifier.pipeline.joblib
+      PART_PREFIX: s3://tinabobina/models/xgb_classifier.pipeline.joblib.part
+      MANIFEST_KEY: models/xgb_classifier.pipeline.manifest.json
+      EXPIRES_SECONDS: 21600  # 6h
+
+    steps:
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::719070647059:role/tigermoon
+          role-session-name: presign-multipart
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq coreutils
+
+      - name: Download existing model
+        run: |
+          aws s3 cp "$MODEL_S3_URI" model.joblib --only-show-errors
+          ls -lh model.joblib
+
+      - name: Split into 8MB parts
+        run: |
+          mkdir parts
+          split -b 8m -d -a 2 model.joblib parts/part_
+          ls -lh parts
+
+      - name: Upload parts
+        run: |
+          i=0
+          for f in parts/part_*; do
+            num=$(printf "%02d" $i)
+            aws s3 cp "$f" "${PART_PREFIX}${num}" --only-show-errors
+            echo "uploaded: ${PART_PREFIX}${num}"
+            i=$((i+1))
+          done
+          echo "TOTAL_PARTS=$i" >> $GITHUB_ENV
+
+      - name: Presign parts & build manifest
+        id: manifest
+        run: |
+          parts_json="[]"
+          for ((i=0; i<${TOTAL_PARTS}; i++)); do
+            num=$(printf "%02d" $i)
+            url=$(aws s3 presign "${PART_PREFIX}${num}" --expires-in ${EXPIRES_SECONDS})
+            parts_json=$(jq --arg u "$url" '. + [$u]' <<< "$parts_json")
+          done
+          manifest=$(jq -n --arg algo "joblib" --arg mtime "$(date -u +%FT%TZ)" --argjson parts "$parts_json" '{algo:$algo, mtime:$mtime, parts:$parts}')
+          echo "$manifest" > manifest.json
+          aws s3 cp manifest.json "s3://tinabobina/${MANIFEST_KEY}" --only-show-errors
+          manifest_url=$(aws s3 presign "s3://tinabobina/${MANIFEST_KEY}" --expires-in ${EXPIRES_SECONDS})
+          echo "manifest_url=$manifest_url" >> $GITHUB_OUTPUT
+          echo "$manifest" > manifest_preview.json
+
+      - name: Upload artifact (manifest URL)
+        uses: actions/upload-artifact@v4
+        with:
+          name: presigned-manifest-url
+          path: manifest_preview.json
+
+      - name: Print manifest URL
+        run: |
+          echo "MANIFEST_URL: ${{ steps.manifest.outputs.manifest_url }}"
