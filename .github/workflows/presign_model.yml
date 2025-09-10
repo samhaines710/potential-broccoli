@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       object_key:
-        description: "Full S3 object key to presign (e.g., models/xgb_classifier.pipeline.joblib)"
+        description: "Full S3 object key (e.g., models/xgb_classifier.pipeline.joblib)"
         required: true
         default: "models/xgb_classifier.pipeline.joblib"
       expires_in:
-        description: "TTL seconds for the presigned URL (must be <= role session); try 21600 (6h)"
+        description: "TTL seconds (must be <= role session; default 21600 = 6h)"
         required: false
         default: "21600"
 
@@ -37,10 +37,9 @@ jobs:
           role-to-assume: arn:aws:iam::719070647059:role/tigermoon
           role-session-name: tinabobina-presign
           aws-region: ${{ env.AWS_REGION }}
-          # IMPORTANT: URL lifetime is bounded by this session TTL
-          role-duration-seconds: 21600 # 6 hours
+          role-duration-seconds: 21600  # 6h session; URL must not exceed this
 
-      - name: Presign specified object
+      - name: Presign specified object (GET) and verify with Range GET
         id: presign
         env:
           IN_KEY: ${{ inputs.object_key }}
@@ -49,18 +48,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${IN_KEY}" ]]; then
-            echo "Input 'object_key' is required." >&2
-            exit 1
-          fi
+          [[ -n "${IN_KEY}" ]] || { echo "Input 'object_key' is required." >&2; exit 1; }
 
-          # sanity check object exists
+          # Ensure the object exists
           aws s3api head-object --bucket "${BUCKET}" --key "${IN_KEY}" >/dev/null
 
-          # Clamp TTL to be <= session TTL (we set session to 21600s above)
+          # Clamp TTL to session (6h) and S3 max (7d)
           EXPIRES="${EXPIRES_IN:-21600}"
           if [[ "${EXPIRES}" -gt 21600 ]]; then
-            echo "Requested expires_in=${EXPIRES} > session(21600); clamping to 21600." >&2
+            echo "expires_in ${EXPIRES} > session 21600; clamping to 21600." >&2
             EXPIRES=21600
           fi
           if [[ "${EXPIRES}" -gt 604800 ]]; then EXPIRES=604800; fi
@@ -68,11 +64,12 @@ jobs:
           URI="s3://${BUCKET}/${IN_KEY}"
           URL="$(aws s3 presign "${URI}" --expires-in "${EXPIRES}")"
 
-          # HEAD-validate from runner (fail fast if blocked/invalid)
-          code=$(curl -sSI -o /dev/null -w "%{http_code}" --max-time 20 "${URL}" || true)
-          if [[ "${code}" != "200" ]]; then
-            echo "Presigned URL is not directly reachable (HEAD HTTP ${code})." >&2
-            echo "Check bucket policy / object encryption / region or retry." >&2
+          # ✅ Validate using GET with Range (method must match signature)
+          code=$(curl -sS -H "Range: bytes=0-0" -o /dev/null -w "%{http_code}" --max-time 30 "${URL}" || echo "ERR")
+
+          if [[ "${code}" != "200" && "${code}" != "206" ]]; then
+            echo "Presigned URL GET returned ${code}. Response preview:" >&2
+            curl -sS --max-time 30 "${URL}" | head -c 400 >&2 || true
             exit 1
           fi
 
@@ -91,18 +88,18 @@ jobs:
 
           {
             echo "### Model download links"
-            echo ""
+            echo
             echo "- **S3 URI**"
-            echo ""
+            echo
             echo "  \`${{ steps.presign.outputs.s3_uri }}\`"
-            echo ""
+            echo
             echo "#### Presigned URL (paste into QuantConnect)"
-            echo ""
+            echo
             echo '```'
             echo "${{ steps.presign.outputs.presigned_url }}"
             echo '```'
-            echo ""
-            echo "_Note: Valid for ≤ role session (6h here). Regenerate as needed._"
+            echo
+            echo "_Note: Valid up to the role session (6h here). Regenerate as needed._"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload URL artifact
