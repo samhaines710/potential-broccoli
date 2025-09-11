@@ -1,27 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# MODEL_URI can be a local path or s3://bucket/key
-MODEL_URI="${MODEL_URI:-/app/models/xgb_classifier.pipeline.joblib}"
-AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-eu-north-1}"
+# Render injects $PORT; default for local runs
+PORT="${PORT:-10000}"
 
-mkdir -p "$(dirname "$MODEL_URI")"
+# APP_MODULE: dotted path to ASGI/WSGI app. Defaults to "main:app"
+APP_MODULE="${APP_MODULE:-main:app}"
 
-# If MODEL_URI is s3://..., download once to the canonical local path
-if [[ "$MODEL_URI" == s3://* ]]; then
-  if [[ ! -f "/app/models/model.loaded" ]]; then
-    python - <<PY
-import os, pathlib, boto3
-uri = os.environ["MODEL_URI"]
-bucket, key = uri[5:].split("/", 1)
-dst = "/app/models/xgb_classifier.pipeline.joblib"
-pathlib.Path("/app/models").mkdir(parents=True, exist_ok=True)
-boto3.client("s3", region_name=os.getenv("AWS_DEFAULT_REGION","eu-north-1")).download_file(bucket, key, dst)
-open("/app/models/model.loaded","w").write("ok")
-print(f"Downloaded {uri} -> {dst}")
-PY
-  fi
+# APP_SERVER: uvicorn (ASGI) or gunicorn (WSGI)
+APP_SERVER="${APP_SERVER:-uvicorn}"
+
+echo "[BOOT] Starting ${APP_SERVER} with module ${APP_MODULE} on :${PORT}"
+
+if [ "$APP_SERVER" = "uvicorn" ]; then
+  # FastAPI / Starlette / any ASGI app
+  exec uvicorn "$APP_MODULE" --host 0.0.0.0 --port "${PORT}"
+else
+  # Flask / Django (WSGI)
+  # For Flask, set APP_MODULE=app:app (or your module)
+  exec gunicorn "$APP_MODULE" -b "0.0.0.0:${PORT}" --workers "${WEB_CONCURRENCY:-2}" --timeout 120
 fi
-
-# Start the application
-exec python -u grond_orchestrator.py
