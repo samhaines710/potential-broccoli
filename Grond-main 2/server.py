@@ -6,8 +6,7 @@ from typing import Optional
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-# your existing orchestrator (the file you showed)
-from grond_orchestrator import GrondOrchestrator
+from grond_orchestrator import GrondOrchestrator  # your existing orchestrator
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -20,20 +19,18 @@ app = FastAPI(title="Grond Service", version=os.getenv("SERVICE_VERSION", "1.0.0
 _worker: Optional[threading.Thread] = None
 _orchestrator: Optional[GrondOrchestrator] = None
 
-
 def _run_orchestrator() -> None:
     global _orchestrator
     try:
         LOG.info("Starting GrondOrchestrator background thread.")
         _orchestrator = GrondOrchestrator()
-        _orchestrator.run()  # blocking loop inside the class
+        _orchestrator.run()
     except SystemExit:
         LOG.info("GrondOrchestrator requested exit.")
     except Exception as e:
         LOG.exception("Fatal error in orchestrator: %s", e)
     finally:
         LOG.info("Background orchestrator thread exiting.")
-
 
 @app.on_event("startup")
 def on_startup() -> None:
@@ -43,16 +40,13 @@ def on_startup() -> None:
         _worker.start()
         LOG.info("Background worker started.")
 
-
 @app.get("/health", tags=["ops"])
 def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
-
 @app.get("/ready", tags=["ops"])
 def ready() -> JSONResponse:
     return JSONResponse({"ready": True})
-
 
 @app.get("/", tags=["ops"])
 def root() -> JSONResponse:
