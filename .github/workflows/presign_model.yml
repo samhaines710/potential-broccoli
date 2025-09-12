@@ -1,4 +1,4 @@
-name: Presign Existing Model (no-train)
+name: Presign Existing Model (12h, no-train)
 
 on:
   workflow_dispatch:
@@ -7,10 +7,6 @@ on:
         description: "Full S3 object key (e.g., models/xgb_classifier.pipeline.joblib)"
         required: true
         default: "models/xgb_classifier.pipeline.joblib"
-      expires_in:
-        description: "TTL seconds (request up to 24h=86400; will clamp to STS session)"
-        required: false
-        default: "86400"   # request 24h
 
 env:
   AWS_REGION: eu-north-1
@@ -28,47 +24,38 @@ jobs:
       presigned_url: ${{ steps.presign.outputs.presigned_url }}
 
     steps:
-      - name: Checkout (for OIDC context only)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
+      - name: Configure AWS credentials (OIDC, 12h session)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::719070647059:role/tigermoon
           role-session-name: tinabobina-presign
           aws-region: ${{ env.AWS_REGION }}
-          role-duration-seconds: 43200  # 12h: MAX for OIDC STS; URL can't exceed this
+          role-duration-seconds: 43200  # 12h (ensure the role's Max session duration is set to 12h)
 
-      - name: Presign specified object (GET) and verify with Range GET
+      - name: Presign S3 object for 12h and validate
         id: presign
         env:
           IN_KEY: ${{ inputs.object_key }}
-          EXPIRES_IN: ${{ inputs.expires_in }}
           BUCKET: ${{ env.BUCKET }}
         run: |
           set -euo pipefail
 
-          [[ -n "${IN_KEY}" ]] || { echo "Input 'object_key' is required." >&2; exit 1; }
-
-          # Ensure the object exists
+          # Ensure object exists
           aws s3api head-object --bucket "${BUCKET}" --key "${IN_KEY}" >/dev/null
 
-          # Clamp TTL to STS session (12h here) and S3 max (7d)
-          REQ="${EXPIRES_IN:-86400}"   # requested TTL (default 24h)
-          SESSION=43200                # must match role-duration-seconds above
-          if [[ "${REQ}" -gt "${SESSION}" ]]; then
-            echo "Requested expires_in ${REQ}s > session ${SESSION}s; clamping to ${SESSION}s." >&2
-            REQ="${SESSION}"
-          fi
-          if [[ "${REQ}" -gt 604800 ]]; then REQ=604800; fi  # S3 absolute max 7d
+          # With OIDC the presigned URL cannot outlive the STS session.
+          EXPIRES=43200  # exact 12h
 
           URI="s3://${BUCKET}/${IN_KEY}"
-          URL="$(aws s3 presign "${URI}" --expires-in "${REQ}")"
+          URL="$(aws s3 presign "${URI}" --expires-in "${EXPIRES}")"
 
-          # Validate the URL works (HEAD often fails on presign; use Range GET)
+          # Validate URL by doing a range GET (HEAD can fail on presigned URLs)
           code=$(curl -sS -H "Range: bytes=0-0" -o /dev/null -w "%{http_code}" --max-time 30 "${URL}" || echo "ERR")
           if [[ "${code}" != "200" && "${code}" != "206" ]]; then
-            echo "Presigned URL GET returned ${code}. Response preview:" >&2
+            echo "Presigned URL validation failed with HTTP ${code}" >&2
             curl -sS --max-time 30 "${URL}" | head -c 400 >&2 || true
             exit 1
           fi
@@ -80,29 +67,29 @@ jobs:
           echo "Presigned URL (paste into Render env MODEL_PRESIGNED_URL):"
           echo "${URL}"
 
-      - name: Write URL files and job summary
+      - name: Write artifacts and summary
         if: ${{ always() }}
         run: |
           echo "${{ steps.presign.outputs.s3_uri }}" > s3_uri.txt || true
           echo "${{ steps.presign.outputs.presigned_url }}" > presigned_url.txt || true
 
           {
-            echo "### Model download links"
+            echo "### 12-hour Presigned Model URL"
             echo
             echo "- **S3 URI**"
             echo
             echo "  \`${{ steps.presign.outputs.s3_uri }}\`"
             echo
-            echo "#### Presigned URL (paste into Render → Environment → MODEL_PRESIGNED_URL)"
+            echo "- **Presigned URL** (paste into Render → Environment → \`MODEL_PRESIGNED_URL\`)"
             echo
             echo '```'
             echo "${{ steps.presign.outputs.presigned_url }}"
             echo '```'
             echo
-            echo "_Note:_ You requested 24h (86400s). With GitHub OIDC, the URL lifetime is clamped to the STS session (set to 12h here)."
+            echo "_Note:_ URL lifetime is 12 hours (OIDC session cap). Regenerate before expiry or automate rotation."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload URL artifact
+      - name: Upload presigned URL artifact
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
