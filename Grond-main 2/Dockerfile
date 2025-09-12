@@ -20,36 +20,59 @@ ENV PYTHONUNBUFFERED=1 \
     APP_MODULE=server:app \
     PYTHONPATH=/app
 
-# Copy code first so files are present for installs/import checks
+# Copy code
 COPY . /app
 
 # Ensure model dir exists
 RUN mkdir -p /app/models
 
-# Install deps: FastAPI/servers + your project requirements if present
+# Install deps
 RUN python -m pip install --upgrade pip \
  && pip install --no-cache-dir fastapi uvicorn gunicorn requests boto3 \
  && if [ -f /app/requirements.txt ] && [ -s /app/requirements.txt ]; then \
         pip install --no-cache-dir -r /app/requirements.txt ; \
     fi
 
-# Inline entrypoint with pre-import check; prints full traceback if import fails
-RUN printf '%s\n' '#!/usr/bin/env bash' \
- 'set -euo pipefail' \
- 'echo "[DEBUG] PYTHONPATH=$PYTHONPATH"' \
- 'echo "[DEBUG] Listing /app:"' \
- 'ls -la /app || true' \
- 'echo "[DEBUG] Import check for ${APP_MODULE}..."' \
- 'python - <<PY\nimport os, sys, importlib, traceback\nprint(\"sys.path:\", sys.path)\nmod, _, attr = os.environ[\"APP_MODULE\"].partition(\":\")\ntry:\n    m = importlib.import_module(mod)\n    if attr:\n        getattr(m, attr)\n    print(\"[DEBUG] Import OK:\", mod)\nexcept Exception as e:\n    print(\"[DEBUG] Import FAILED:\", e)\n    traceback.print_exc()\n    raise\nPY' \
- 'PORT="${PORT:-10000}"' \
- 'echo "[BOOT] ${APP_SERVER} ${APP_MODULE} on :${PORT}"' \
- 'if [ "${APP_SERVER}" = "uvicorn" ]; then' \
- '  exec uvicorn "${APP_MODULE}" --host 0.0.0.0 --port "${PORT}"' \
- 'else' \
- '  exec gunicorn "${APP_MODULE}" -b "0.0.0.0:${PORT}" --workers "${WEB_CONCURRENCY}" --timeout 120' \
- 'fi' \
- > /usr/local/bin/entrypoint.sh \
- && chmod 0755 /usr/local/bin/entrypoint.sh
+# Write a small Python import checker
+RUN cat > /usr/local/bin/import_check.py <<'PY'
+import os, sys, importlib, traceback
+mod, _, attr = os.environ.get("APP_MODULE","server:app").partition(":")
+print("sys.path:", sys.path)
+print("[DEBUG] Checking import:", mod, "attr:", attr)
+try:
+    m = importlib.import_module(mod)
+    if attr:
+        getattr(m, attr)
+    print("[DEBUG] Import OK:", mod)
+except Exception as e:
+    print("[DEBUG] Import FAILED:", e)
+    traceback.print_exc()
+    raise
+PY
+RUN chmod 0755 /usr/local/bin/import_check.py
+
+# Write entrypoint (no nested heredocs)
+RUN cat > /usr/local/bin/entrypoint.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[DEBUG] PYTHONPATH=$PYTHONPATH"
+echo "[DEBUG] Listing /app:"
+ls -la /app || true
+
+echo "[DEBUG] Import check for ${APP_MODULE}..."
+python /usr/local/bin/import_check.py
+
+PORT="${PORT:-10000}"
+echo "[BOOT] ${APP_SERVER} ${APP_MODULE} on :${PORT}"
+
+if [ "${APP_SERVER}" = "uvicorn" ]; then
+  exec uvicorn "${APP_MODULE}" --host 0.0.0.0 --port "${PORT}"
+else
+  exec gunicorn "${APP_MODULE}" -b "0.0.0.0:${PORT}" --workers "${WEB_CONCURRENCY}" --timeout 120
+fi
+SH
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 # Non-root
 RUN addgroup --system app && adduser --system --ingroup app app \
