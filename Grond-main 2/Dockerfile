@@ -15,7 +15,9 @@ ENV PYTHONUNBUFFERED=1 \
     MODEL_URI=/app/models/xgb_classifier.pipeline.joblib \
     ML_MODEL_PATH=/app/models/xgb_classifier.pipeline.joblib \
     PORT=10000 \
-    WEB_CONCURRENCY=2
+    WEB_CONCURRENCY=1 \
+    APP_SERVER=uvicorn \
+    APP_MODULE=server:app
 
 # Copy application first (ensures requirements.txt is available in /app)
 COPY . /app
@@ -23,19 +25,20 @@ COPY . /app
 # Ensure models dir exists
 RUN mkdir -p /app/models
 
-# Install deps
+# Install deps (FastAPI + servers + your requirements if present)
 RUN python -m pip install --upgrade pip \
- && pip install --no-cache-dir gunicorn uvicorn boto3 requests \
+ && pip install --no-cache-dir fastapi gunicorn uvicorn boto3 requests \
  && if [ -f /app/requirements.txt ] && [ -s /app/requirements.txt ]; then \
         pip install --no-cache-dir -r /app/requirements.txt ; \
     fi
 
-# Inline entrypoint (no external file)
+# Inline entrypoint (no external file needed)
 RUN printf '%s\n' '#!/usr/bin/env bash' \
  'set -euo pipefail' \
  'PORT="${PORT:-10000}"' \
- 'APP_MODULE="${APP_MODULE:-main:app}"' \
+ 'APP_MODULE="${APP_MODULE:-server:app}"' \
  'APP_SERVER="${APP_SERVER:-uvicorn}"' \
+ 'WEB_CONCURRENCY="${WEB_CONCURRENCY:-1}"' \
  'echo "[BOOT] ${APP_SERVER} ${APP_MODULE} on :${PORT}"' \
  'if [ "${APP_SERVER}" = "uvicorn" ]; then' \
  '  exec uvicorn "${APP_MODULE}" --host 0.0.0.0 --port "${PORT}"' \
