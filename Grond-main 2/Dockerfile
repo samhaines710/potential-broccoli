@@ -20,10 +20,10 @@ ENV PYTHONUNBUFFERED=1 \
     APP_MODULE=server:app \
     PYTHONPATH=/app
 
-# Copy code
+# Copy code (Render Root Directory = "Grond-main 2")
 COPY . /app
 
-# Ensure model dir exists
+# Ensure models dir exists
 RUN mkdir -p /app/models
 
 # Install deps
@@ -33,7 +33,7 @@ RUN python -m pip install --upgrade pip \
         pip install --no-cache-dir -r /app/requirements.txt ; \
     fi
 
-# Write a small Python import checker
+# Write a Python import checker
 RUN cat > /usr/local/bin/import_check.py <<'PY'
 import os, sys, importlib, traceback
 mod, _, attr = os.environ.get("APP_MODULE","server:app").partition(":")
@@ -51,14 +51,30 @@ except Exception as e:
 PY
 RUN chmod 0755 /usr/local/bin/import_check.py
 
-# Write entrypoint (no nested heredocs)
+# Entry point with auto-detect + verbose diagnostics
 RUN cat > /usr/local/bin/entrypoint.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
 echo "[DEBUG] PYTHONPATH=$PYTHONPATH"
-echo "[DEBUG] Listing /app:"
+echo "[DEBUG] Listing /app top-level:"
 ls -la /app || true
+echo "[DEBUG] Searching for candidate app files:"
+find /app -maxdepth 2 -type f \( -name 'server.py' -o -name 'serve_mlclassifier.py' \) -print || true
+
+# Auto-select APP_MODULE based on what actually exists in the image
+if [ -f /app/server.py ]; then
+  export APP_MODULE="server:app"
+  echo "[DEBUG] Auto-selected APP_MODULE=server:app"
+elif [ -f /app/serve_mlclassifier.py ]; then
+  export APP_MODULE="serve_mlclassifier:app"
+  echo "[DEBUG] Auto-selected APP_MODULE=serve_mlclassifier:app"
+else
+  echo "[FATAL] Neither /app/server.py nor /app/serve_mlclassifier.py exists."
+  echo "[HINT] Check Render Root Directory and that these files are committed under it."
+  find /app -maxdepth 3 -type f -name '*.py' -print || true
+  exit 1
+fi
 
 echo "[DEBUG] Import check for ${APP_MODULE}..."
 python /usr/local/bin/import_check.py
