@@ -1,10 +1,6 @@
 # server.py
-# Runs your ML API (serve_mlclassifier.app) AND starts the Grond orchestrator in the same
-# process. It also downloads the model BEFORE importing serve_mlclassifier so import-time
-# model loads succeed. Designed for Render with:
-#   APP_SERVER=uvicorn
-#   APP_MODULE=server:app
-#   WEB_CONCURRENCY=1
+# Uses your existing FastAPI app from serve_mlclassifier AND starts the Grond
+# orchestrator in a background thread. Also downloads the model before import.
 from __future__ import annotations
 
 import os
@@ -12,17 +8,14 @@ import sys
 import threading
 import logging
 import traceback
-from typing import Optional
+from typing import Any
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Environment / logging basics
-# ──────────────────────────────────────────────────────────────────────────────
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")  # quiet matplotlib in containers
+# Quieter matplotlib in containers
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 
 def _configure_logging() -> None:
-    # idempotent root logger setup
     root = logging.getLogger()
     if not root.handlers:
         logging.basicConfig(
@@ -37,42 +30,48 @@ _configure_logging()
 LOG = logging.getLogger("server")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Model bootstrap BEFORE importing anything that loads the model at import time
-# ──────────────────────────────────────────────────────────────────────────────
 def _ensure_model_early() -> None:
-    """Download/verify the model to /app/models/* using MODEL_PRESIGNED_URL if set."""
+    """Download/verify model to /app/models/* using MODEL_PRESIGNED_URL (if set)."""
     try:
-        from utils.model_fetch import ensure_model  # local helper (safe if missing)
+        from utils.model_fetch import ensure_model  # type: ignore
         ensure_model()
         LOG.info("Model bootstrap: ensure_model() completed.")
     except Exception as e:
-        # Do not crash: some endpoints may not need the model; log loudly.
         LOG.warning("Model bootstrap skipped/failed: %s", e)
 
 
+# Pull the model BEFORE importing serve_mlclassifier (it loads at import time)
 _ensure_model_early()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Try to import your existing FastAPI app (serve_mlclassifier.app)
-# If that fails, fall back to a minimal app and still try to run the orchestrator.
-# ──────────────────────────────────────────────────────────────────────────────
-app = None  # will be assigned below
+def _attach_ops_endpoints(app_obj) -> None:
+    """Add /health and /ready if they aren't present."""
+    have_health = any(getattr(r, "path", None) == "/health" for r in getattr(app_obj.router, "routes", []))
+    have_ready = any(getattr(r, "path", None) == "/ready" for r in getattr(app_obj.router, "routes", []))
+    if not have_health:
+        @app_obj.get("/health", tags=["ops"])
+        def _health() -> dict[str, Any]:
+            return {"status": "ok"}
+    if not have_ready:
+        @app_obj.get("/ready", tags=["ops"])
+        def _ready() -> dict[str, Any]:
+            return {"ready": True}
 
 
-def _start_orchestrator_on(app_obj) -> None:
-    """Attach a startup hook to start GrondOrchestrator in a background thread."""
+def _attach_orchestrator_startup(app_obj) -> None:
+    """Start GrondOrchestrator in a daemon thread on FastAPI startup.
+       Stores references on app.state to avoid globals."""
     try:
         from grond_orchestrator import GrondOrchestrator  # type: ignore
     except Exception as e:
         LOG.error("Cannot import GrondOrchestrator: %s", e)
         return
 
-    # module-level globals so handlers can mutate
-    global _worker, _orchestrator
-    _worker: Optional[threading.Thread] = None
-    _orchestrator: Optional[GrondOrchestrator] = None
+    # Init state holders once
+    if not hasattr(app_obj.state, "grond_worker"):
+        app_obj.state.grond_worker = None
+    if not hasattr(app_obj.state, "grond_orchestrator"):
+        app_obj.state.grond_orchestrator = None
 
     def _ensure_model_late() -> None:
         try:
@@ -82,13 +81,13 @@ def _start_orchestrator_on(app_obj) -> None:
             LOG.warning("Late model bootstrap skipped/failed: %s", ee)
 
     def _run_orchestrator() -> None:
-        global _orchestrator
         try:
             LOG.info("Bootstrap (late): ensuring model presence.")
             _ensure_model_late()
             LOG.info("Starting GrondOrchestrator background thread.")
-            _orchestrator = GrondOrchestrator()
-            _orchestrator.run()  # blocking loop
+            orch = GrondOrchestrator()
+            app_obj.state.grond_orchestrator = orch
+            orch.run()  # blocking loop
         except SystemExit:
             LOG.info("GrondOrchestrator requested exit.")
         except Exception as ex:
@@ -98,46 +97,31 @@ def _start_orchestrator_on(app_obj) -> None:
 
     @app_obj.on_event("startup")
     def _on_startup() -> None:
-        # Gate via env if you ever need API-only mode
+        # Gate via env for API-only runs
         if os.getenv("START_ORCHESTRATOR", "1").lower() in {"0", "false", "no"}:
             LOG.info("START_ORCHESTRATOR disabled; not starting orchestrator.")
             return
-        global _worker
-        if _worker is None or not _worker.is_alive():
-            _worker = threading.Thread(target=_run_orchestrator, name="grond-worker", daemon=True)
-            _worker.start()
+        worker = getattr(app_obj.state, "grond_worker", None)
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(target=_run_orchestrator, name="grond-worker", daemon=True)
+            app_obj.state.grond_worker = worker
+            worker.start()
             LOG.info("Background worker started (orchestrator).")
 
 
-def _attach_ops_endpoints(app_obj) -> None:
-    """Add /health and /ready if they don't already exist."""
-    have_health = any(getattr(r, "path", None) == "/health" for r in getattr(app_obj.router, "routes", []))
-    have_ready = any(getattr(r, "path", None) == "/ready" for r in getattr(app_obj.router, "routes", []))
-    if not have_health:
-        @app_obj.get("/health", tags=["ops"])
-        def _health() -> dict:
-            return {"status": "ok"}
-    if not have_ready:
-        @app_obj.get("/ready", tags=["ops"])
-        def _ready() -> dict:
-            return {"ready": True}
-
-
-# Attempt the fast path: import the existing ML API app
+# Try to use your existing FastAPI app from serve_mlclassifier
 try:
-    from serve_mlclassifier import app as _ml_app  # FastAPI instance provided by your module
+    from serve_mlclassifier import app as _ml_app  # FastAPI instance
 except Exception as e:
-    # Surface the real reason; keep the service alive with a diagnostic app
     print(f"[SERVER IMPORT ERROR] serve_mlclassifier import failed: {e}", file=sys.stderr)
     traceback.print_exc()
 
+    # Fallback: minimal app that still tries to run the orchestrator
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
     app = FastAPI(title="Grond Service (fallback)", version=os.getenv("SERVICE_VERSION", "1.0.0"))  # type: ignore
-
-    # Try to start orchestrator even in fallback mode
-    _start_orchestrator_on(app)
+    _attach_orchestrator_startup(app)
     _attach_ops_endpoints(app)
 
     @app.get("/", tags=["ops"])  # type: ignore
@@ -149,10 +133,9 @@ except Exception as e:
                 "warning": "serve_mlclassifier import failed; see logs.",
             }
         )
-
 else:
-    # Success: use your ML API app AND start the orchestrator on startup
-    app = _ml_app  # use the app from serve_mlclassifier
-    _start_orchestrator_on(app)
+    # Success: keep your original app AND start the orchestrator on startup
+    app = _ml_app  # noqa: F401
+    _attach_orchestrator_startup(app)
     _attach_ops_endpoints(app)
     LOG.info("serve_mlclassifier.app loaded; orchestrator will start on startup.")
