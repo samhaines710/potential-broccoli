@@ -1,4 +1,10 @@
 # server.py
+# Runs your ML API (serve_mlclassifier.app) AND starts the Grond orchestrator in the same
+# process. It also downloads the model BEFORE importing serve_mlclassifier so import-time
+# model loads succeed. Designed for Render with:
+#   APP_SERVER=uvicorn
+#   APP_MODULE=server:app
+#   WEB_CONCURRENCY=1
 from __future__ import annotations
 
 import os
@@ -8,106 +14,145 @@ import logging
 import traceback
 from typing import Optional
 
-# Reduce matplotlib noise under non-root home
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")
+# ──────────────────────────────────────────────────────────────────────────────
+# Environment / logging basics
+# ──────────────────────────────────────────────────────────────────────────────
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")  # quiet matplotlib in containers
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# ── Bootstrap the model BEFORE importing anything that needs it ───────────────
+
+def _configure_logging() -> None:
+    # idempotent root logger setup
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=LOG_LEVEL,
+            format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+        )
+    else:
+        root.setLevel(LOG_LEVEL)
+
+
+_configure_logging()
+LOG = logging.getLogger("server")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model bootstrap BEFORE importing anything that loads the model at import time
+# ──────────────────────────────────────────────────────────────────────────────
 def _ensure_model_early() -> None:
+    """Download/verify the model to /app/models/* using MODEL_PRESIGNED_URL if set."""
     try:
-        from utils.model_fetch import ensure_model  # local helper
+        from utils.model_fetch import ensure_model  # local helper (safe if missing)
         ensure_model()
+        LOG.info("Model bootstrap: ensure_model() completed.")
     except Exception as e:
-        # Do not crash the process—just log. Some code paths might not need the model.
-        logging.getLogger("server").warning("Model bootstrap skipped/failed: %s", e)
+        # Do not crash: some endpoints may not need the model; log loudly.
+        LOG.warning("Model bootstrap skipped/failed: %s", e)
 
-# Pull model via MODEL_PRESIGNED_URL (if provided) so import-time loads succeed.
+
 _ensure_model_early()
 
-# ── Fast path: if your existing module exposes `app = FastAPI(...)`, re-export it
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Try to import your existing FastAPI app (serve_mlclassifier.app)
+# If that fails, fall back to a minimal app and still try to run the orchestrator.
+# ──────────────────────────────────────────────────────────────────────────────
+app = None  # will be assigned below
+
+
+def _start_orchestrator_on(app_obj) -> None:
+    """Attach a startup hook to start GrondOrchestrator in a background thread."""
+    try:
+        from grond_orchestrator import GrondOrchestrator  # type: ignore
+    except Exception as e:
+        LOG.error("Cannot import GrondOrchestrator: %s", e)
+        return
+
+    # module-level globals so handlers can mutate
+    global _worker, _orchestrator
+    _worker: Optional[threading.Thread] = None
+    _orchestrator: Optional[GrondOrchestrator] = None
+
+    def _ensure_model_late() -> None:
+        try:
+            from utils.model_fetch import ensure_model  # type: ignore
+            ensure_model()
+        except Exception as ee:
+            LOG.warning("Late model bootstrap skipped/failed: %s", ee)
+
+    def _run_orchestrator() -> None:
+        global _orchestrator
+        try:
+            LOG.info("Bootstrap (late): ensuring model presence.")
+            _ensure_model_late()
+            LOG.info("Starting GrondOrchestrator background thread.")
+            _orchestrator = GrondOrchestrator()
+            _orchestrator.run()  # blocking loop
+        except SystemExit:
+            LOG.info("GrondOrchestrator requested exit.")
+        except Exception as ex:
+            LOG.exception("Fatal error in orchestrator: %s", ex)
+        finally:
+            LOG.info("Background orchestrator thread exiting.")
+
+    @app_obj.on_event("startup")
+    def _on_startup() -> None:
+        # Gate via env if you ever need API-only mode
+        if os.getenv("START_ORCHESTRATOR", "1").lower() in {"0", "false", "no"}:
+            LOG.info("START_ORCHESTRATOR disabled; not starting orchestrator.")
+            return
+        global _worker
+        if _worker is None or not _worker.is_alive():
+            _worker = threading.Thread(target=_run_orchestrator, name="grond-worker", daemon=True)
+            _worker.start()
+            LOG.info("Background worker started (orchestrator).")
+
+
+def _attach_ops_endpoints(app_obj) -> None:
+    """Add /health and /ready if they don't already exist."""
+    have_health = any(getattr(r, "path", None) == "/health" for r in getattr(app_obj.router, "routes", []))
+    have_ready = any(getattr(r, "path", None) == "/ready" for r in getattr(app_obj.router, "routes", []))
+    if not have_health:
+        @app_obj.get("/health", tags=["ops"])
+        def _health() -> dict:
+            return {"status": "ok"}
+    if not have_ready:
+        @app_obj.get("/ready", tags=["ops"])
+        def _ready() -> dict:
+            return {"ready": True}
+
+
+# Attempt the fast path: import the existing ML API app
 try:
-    from serve_mlclassifier import app as app  # noqa: F401
+    from serve_mlclassifier import app as _ml_app  # FastAPI instance provided by your module
 except Exception as e:
-    # Show the real reason in logs, then fall back to a tiny ASGI wrapper
+    # Surface the real reason; keep the service alive with a diagnostic app
     print(f"[SERVER IMPORT ERROR] serve_mlclassifier import failed: {e}", file=sys.stderr)
     traceback.print_exc()
 
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
-    # Late bootstrap (safe no-op if already downloaded)
-    def _ensure_model() -> None:
-        try:
-            from utils.model_fetch import ensure_model  # type: ignore
-            ensure_model()
-        except Exception as ee:
-            logging.getLogger("server").warning("Model bootstrap skipped/failed: %s", ee)
+    app = FastAPI(title="Grond Service (fallback)", version=os.getenv("SERVICE_VERSION", "1.0.0"))  # type: ignore
 
-    try:
-        from grond_orchestrator import GrondOrchestrator  # type: ignore
-    except Exception as ee:
-        logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-        app = FastAPI(title="Grond Service (import error)", version="0")  # noqa: F401
+    # Try to start orchestrator even in fallback mode
+    _start_orchestrator_on(app)
+    _attach_ops_endpoints(app)
 
-        @app.get("/health")
-        def _health_err() -> JSONResponse:
-            return JSONResponse(
-                {"status": "degraded", "error": f"orchestrator import failed: {ee}"},
-                status_code=500,
-            )
-
-        @app.get("/")
-        def _root_err() -> JSONResponse:
-            return JSONResponse(
-                {"service": "grond", "error": f"orchestrator import failed: {ee}"},
-                status_code=500,
-            )
-
-    else:
-        # Normal fallback: run orchestrator on a background thread; expose ops endpoints
-        logging.basicConfig(
-            level=os.getenv("LOG_LEVEL", "INFO"),
-            format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    @app.get("/", tags=["ops"])  # type: ignore
+    def root() -> JSONResponse:
+        return JSONResponse(
+            {
+                "service": "grond",
+                "version": os.getenv("SERVICE_VERSION", "1.0.0"),
+                "warning": "serve_mlclassifier import failed; see logs.",
+            }
         )
-        LOG = logging.getLogger("server")
 
-        app = FastAPI(title="Grond Service", version=os.getenv("SERVICE_VERSION", "1.0.0"))  # noqa: F401
-
-        _worker: Optional[threading.Thread] = None
-        _orchestrator: Optional[GrondOrchestrator] = None
-
-        def _run_orchestrator() -> None:
-            """Blocking trading loop in a daemon thread."""
-            global _orchestrator
-            try:
-                LOG.info("Bootstrap: ensuring model presence.")
-                _ensure_model()
-                LOG.info("Starting GrondOrchestrator background thread.")
-                _orchestrator = GrondOrchestrator()
-                _orchestrator.run()
-            except SystemExit:
-                LOG.info("GrondOrchestrator requested exit.")
-            except Exception as ex:
-                LOG.exception("Fatal error in orchestrator: %s", ex)
-            finally:
-                LOG.info("Background orchestrator thread exiting.")
-
-        @app.on_event("startup")
-        def _on_startup() -> None:
-            global _worker
-            if _worker is None or not _worker.is_alive():
-                # IMPORTANT: keep WEB_CONCURRENCY=1 in Render
-                _worker = threading.Thread(target=_run_orchestrator, name="grond-worker", daemon=True)
-                _worker.start()
-                LOG.info("Background worker started.")
-
-        @app.get("/health", tags=["ops"])
-        def health() -> JSONResponse:
-            return JSONResponse({"status": "ok"})
-
-        @app.get("/ready", tags=["ops"])
-        def ready() -> JSONResponse:
-            return JSONResponse({"ready": True})
-
-        @app.get("/", tags=["ops"])
-        def root() -> JSONResponse:
-            return JSONResponse({"service": "grond", "version": os.getenv("SERVICE_VERSION", "1.0.0")})
+else:
+    # Success: use your ML API app AND start the orchestrator on startup
+    app = _ml_app  # use the app from serve_mlclassifier
+    _start_orchestrator_on(app)
+    _attach_ops_endpoints(app)
+    LOG.info("serve_mlclassifier.app loaded; orchestrator will start on startup.")
