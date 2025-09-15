@@ -8,10 +8,22 @@ import logging
 import traceback
 from typing import Optional
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Fast path: if your existing module exposes `app = FastAPI(...)`, re-export it
-# so uvicorn can import `server:app` without touching anything else.
-# ──────────────────────────────────────────────────────────────────────────────
+# Reduce matplotlib noise under non-root home
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")
+
+# ── Bootstrap the model BEFORE importing anything that needs it ───────────────
+def _ensure_model_early() -> None:
+    try:
+        from utils.model_fetch import ensure_model  # local helper
+        ensure_model()
+    except Exception as e:
+        # Do not crash the process—just log. Some code paths might not need the model.
+        logging.getLogger("server").warning("Model bootstrap skipped/failed: %s", e)
+
+# Pull model via MODEL_PRESIGNED_URL (if provided) so import-time loads succeed.
+_ensure_model_early()
+
+# ── Fast path: if your existing module exposes `app = FastAPI(...)`, re-export it
 try:
     from serve_mlclassifier import app as app  # noqa: F401
 except Exception as e:
@@ -22,7 +34,7 @@ except Exception as e:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
-    # Optional model bootstrap via presigned URL
+    # Late bootstrap (safe no-op if already downloaded)
     def _ensure_model() -> None:
         try:
             from utils.model_fetch import ensure_model  # type: ignore
@@ -30,7 +42,6 @@ except Exception as e:
         except Exception as ee:
             logging.getLogger("server").warning("Model bootstrap skipped/failed: %s", ee)
 
-    # Try to import your orchestrator; if that fails, expose a diagnostic app
     try:
         from grond_orchestrator import GrondOrchestrator  # type: ignore
     except Exception as ee:
@@ -52,7 +63,7 @@ except Exception as e:
             )
 
     else:
-        # Normal fallback path: run orchestrator in background thread; expose ops endpoints
+        # Normal fallback: run orchestrator on a background thread; expose ops endpoints
         logging.basicConfig(
             level=os.getenv("LOG_LEVEL", "INFO"),
             format="%(asctime)s %(levelname)s %(name)s | %(message)s",
@@ -61,7 +72,6 @@ except Exception as e:
 
         app = FastAPI(title="Grond Service", version=os.getenv("SERVICE_VERSION", "1.0.0"))  # noqa: F401
 
-        # Globals (module scope) so handlers can modify them; avoid 'nonlocal' errors.
         _worker: Optional[threading.Thread] = None
         _orchestrator: Optional[GrondOrchestrator] = None
 
@@ -73,7 +83,7 @@ except Exception as e:
                 _ensure_model()
                 LOG.info("Starting GrondOrchestrator background thread.")
                 _orchestrator = GrondOrchestrator()
-                _orchestrator.run()  # blocking loop
+                _orchestrator.run()
             except SystemExit:
                 LOG.info("GrondOrchestrator requested exit.")
             except Exception as ex:
