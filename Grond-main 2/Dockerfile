@@ -22,7 +22,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 # ── Copy code FROM subfolder (because Root Directory = repo root) ─────────────
 # IMPORTANT: keep the quotes because the folder name contains a space.
-COPY "Grond-main 2/." /app
+COPY ["Grond-main 2/.", "/app"]
+
 
 # Ensure model dir exists (if you download a model at runtime)
 RUN mkdir -p /app/models
