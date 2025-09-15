@@ -18,15 +18,15 @@ ENV PYTHONUNBUFFERED=1 \
     WEB_CONCURRENCY=1 \
     APP_SERVER=uvicorn \
     APP_MODULE=server:app \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    MPLCONFIGDIR=/tmp/mpl
 
-# ── Copy code FROM subfolder (because Root Directory = repo root) ─────────────
-# IMPORTANT: keep the quotes because the folder name contains a space.
+# ── Copy code FROM subfolder (Root Directory = repo root) ─────────────────────
+# Use JSON-array form so the space in the folder name is handled correctly.
 COPY ["Grond-main 2/.", "/app"]
 
-
-# Ensure model dir exists (if you download a model at runtime)
-RUN mkdir -p /app/models
+# Ensure model dir and matplotlib cache dir exist
+RUN mkdir -p /app/models /tmp/mpl && chmod 0777 /tmp/mpl
 
 # ── Python deps ────────────────────────────────────────────────────────────────
 RUN python -m pip install --upgrade pip \
@@ -61,12 +61,6 @@ set -euo pipefail
 echo "[DEBUG] PYTHONPATH=$PYTHONPATH"
 echo "[DEBUG] Listing /app top-level:"
 ls -la /app || true
-echo "[DEBUG] Expecting /app/server.py or a module that provides FastAPI app"
-
-# Quick sanity: ensure server.py exists (your APP_MODULE points to server:app)
-if [ ! -f /app/server.py ]; then
-  echo "[WARN] /app/server.py not found. Will still try to import ${APP_MODULE}."
-fi
 
 echo "[DEBUG] Import check for ${APP_MODULE}..."
 python /usr/local/bin/import_check.py
