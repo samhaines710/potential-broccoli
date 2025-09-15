@@ -3,12 +3,12 @@ FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# System deps
+# ── System deps ────────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 ca-certificates tini bash \
  && rm -rf /var/lib/apt/lists/*
 
-# Runtime env
+# ── Runtime env ────────────────────────────────────────────────────────────────
 ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     AWS_DEFAULT_REGION=eu-north-1 \
@@ -20,20 +20,21 @@ ENV PYTHONUNBUFFERED=1 \
     APP_MODULE=server:app \
     PYTHONPATH=/app
 
-# Copy code (Render Root Directory = "Grond-main 2")
-COPY . /app
+# ── Copy code FROM subfolder (because Root Directory = repo root) ─────────────
+# IMPORTANT: keep the quotes because the folder name contains a space.
+COPY "Grond-main 2/." /app
 
-# Ensure models dir exists
+# Ensure model dir exists (if you download a model at runtime)
 RUN mkdir -p /app/models
 
-# Install deps
+# ── Python deps ────────────────────────────────────────────────────────────────
 RUN python -m pip install --upgrade pip \
  && pip install --no-cache-dir fastapi uvicorn gunicorn requests boto3 \
  && if [ -f /app/requirements.txt ] && [ -s /app/requirements.txt ]; then \
         pip install --no-cache-dir -r /app/requirements.txt ; \
     fi
 
-# Write a Python import checker
+# ── Import checker (prints full traceback if APP_MODULE can't import) ─────────
 RUN cat > /usr/local/bin/import_check.py <<'PY'
 import os, sys, importlib, traceback
 mod, _, attr = os.environ.get("APP_MODULE","server:app").partition(":")
@@ -51,7 +52,7 @@ except Exception as e:
 PY
 RUN chmod 0755 /usr/local/bin/import_check.py
 
-# Entry point with auto-detect + verbose diagnostics
+# ── Entrypoint ────────────────────────────────────────────────────────────────
 RUN cat > /usr/local/bin/entrypoint.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -59,21 +60,11 @@ set -euo pipefail
 echo "[DEBUG] PYTHONPATH=$PYTHONPATH"
 echo "[DEBUG] Listing /app top-level:"
 ls -la /app || true
-echo "[DEBUG] Searching for candidate app files:"
-find /app -maxdepth 2 -type f \( -name 'server.py' -o -name 'serve_mlclassifier.py' \) -print || true
+echo "[DEBUG] Expecting /app/server.py or a module that provides FastAPI app"
 
-# Auto-select APP_MODULE based on what actually exists in the image
-if [ -f /app/server.py ]; then
-  export APP_MODULE="server:app"
-  echo "[DEBUG] Auto-selected APP_MODULE=server:app"
-elif [ -f /app/serve_mlclassifier.py ]; then
-  export APP_MODULE="serve_mlclassifier:app"
-  echo "[DEBUG] Auto-selected APP_MODULE=serve_mlclassifier:app"
-else
-  echo "[FATAL] Neither /app/server.py nor /app/serve_mlclassifier.py exists."
-  echo "[HINT] Check Render Root Directory and that these files are committed under it."
-  find /app -maxdepth 3 -type f -name '*.py' -print || true
-  exit 1
+# Quick sanity: ensure server.py exists (your APP_MODULE points to server:app)
+if [ ! -f /app/server.py ]; then
+  echo "[WARN] /app/server.py not found. Will still try to import ${APP_MODULE}."
 fi
 
 echo "[DEBUG] Import check for ${APP_MODULE}..."
@@ -90,7 +81,7 @@ fi
 SH
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
-# Non-root
+# ── Drop privileges ───────────────────────────────────────────────────────────
 RUN addgroup --system app && adduser --system --ingroup app app \
  && chown -R app:app /app
 USER app
