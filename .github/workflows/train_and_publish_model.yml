@@ -23,12 +23,13 @@ permissions:
 env:
   PYTHONUNBUFFERED: "1"
 
-  # Output paths (written/read from the REPO ROOT)
-  RAW_PREP_OUT: data/movement_training_data.csv
-  HCBC_OUT: data/multiH_binary.csv
-  MODEL_BUNDLE: Resources/xgb_hcbc.bundle.joblib
+  # All outputs are written/read from the REPO ROOT under ./artifacts
+  ARTIFACT_DIR: artifacts
+  RAW_PREP_OUT: artifacts/movement_training_data.csv
+  HCBC_OUT: artifacts/multiH_binary.csv
+  MODEL_BUNDLE: artifacts/xgb_hcbc.bundle.joblib
 
-  # Your repo-level variables (no secrets used in if: guards)
+  # Your repo-level variables
   AWS_REGION: ${{ vars.AWS_REGION }}
   ML_MODEL_PATH: ${{ vars.ML_MODEL_PATH }}
 
@@ -59,14 +60,14 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r "Grond-main 2/requirements.txt"
-          # Pins for trainer/runtime
+          # pins for trainer/runtime
           pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" "fastapi" "pydantic" "uvicorn[standard]"
 
-      # ======== 1) Existing prep (runs from repo root) ========
+      # ======== 1) Existing prep (runs from repo root; writes to ./artifacts) ========
       - name: Prepare (existing pipeline)
         run: |
           set -euo pipefail
-          mkdir -p "$(dirname "${RAW_PREP_OUT}")" "Grond-main 2/Resources"
+          mkdir -p "${ARTIFACT_DIR}" "Grond-main 2/Resources"
           python "Grond-main 2/prepare_training_data.py" --out "${RAW_PREP_OUT}"
 
       - name: Verify prepared dataset
@@ -80,11 +81,10 @@ jobs:
           print(df.columns.tolist()[:40])
           PY
 
-      # ======== 2) Convert to HCBC schema (binary + H) ========
+      # ======== 2) Convert to HCBC schema (binary + H) into ./artifacts ========
       - name: Convert to binary HCBC dataset
         run: |
           set -euo pipefail
-          mkdir -p "$(dirname "${HCBC_OUT}")"
           python "Grond-main 2/prepare_hcbc_dataset.py" \
             --in "${RAW_PREP_OUT}" \
             --out "${HCBC_OUT}" \
@@ -101,11 +101,11 @@ jobs:
           print("Columns:", df.columns.tolist()[:60])
           PY
 
-      # ======== 3) Train + Optuna + calibration ========
+      # ======== 3) Train + Optuna + per-H calibration (writes bundle+reports to ./artifacts) ========
       - name: Train HCBC (XGBoost + Optuna)
         run: |
           set -euo pipefail
-          mkdir -p "$(dirname "${MODEL_BUNDLE}")"
+          mkdir -p "${ARTIFACT_DIR}"
           python "audit_fixes/train_hcbc_xgb_optuna.py" \
             --data "${HCBC_OUT}" \
             --out "${MODEL_BUNDLE}" \
@@ -115,19 +115,19 @@ jobs:
             --seed 42
           test -s "${MODEL_BUNDLE}"
 
-      # ======== 4) Publish artifacts ========
+      # ======== 4) Publish artifacts (bundle + reports from ./artifacts) ========
       - name: Upload artifacts (bundle + reports)
         uses: actions/upload-artifact@v4
         with:
           name: hcbc_model_bundle
           path: |
-            "${{ env.MODEL_BUNDLE }}"
-            "Grond-main 2/Resources/hcbc_cv_report.json"
-            "Grond-main 2/Resources/hcbc_thresholds.json"
-            "Grond-main 2/Resources/hcbc_features.json"
+            artifacts/xgb_hcbc.bundle.joblib
+            artifacts/hcbc_cv_report.json
+            artifacts/hcbc_thresholds.json
+            artifacts/hcbc_features.json
           retention-days: 30
 
-      # ======== 5) Configure AWS via OIDC and upload to S3 (uses your repo vars) ========
+      # ======== 5) Configure AWS via OIDC and upload to S3 (uses repo vars) ========
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
