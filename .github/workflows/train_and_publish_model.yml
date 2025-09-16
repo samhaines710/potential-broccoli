@@ -23,14 +23,17 @@ permissions:
 env:
   PYTHONUNBUFFERED: "1"
 
-  # Canonical locations (match where your prep actually writes)
-  RAW_PREP_OUT: Grond-main 2/data/movement_training_data.csv   # <- your prep's real output
+  # Canonical locations
+  RAW_PREP_OUT: Grond-main 2/data/movement_training_data.csv
   HCBC_OUT: artifacts/multiH_binary.csv
   MODEL_BUNDLE: artifacts/xgb_hcbc.bundle.joblib
 
-  # Repo variables
+  # Repo vars (non-secret)
   AWS_REGION: ${{ vars.AWS_REGION }}
   ML_MODEL_PATH: ${{ vars.ML_MODEL_PATH }}
+
+  # Prefer secret; fallback to repo variable if you keep it there
+  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY != '' && secrets.POLYGON_API_KEY || vars.POLYGON_API_KEY }}
 
 jobs:
   train-and-publish:
@@ -59,22 +62,28 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r "Grond-main 2/requirements.txt"
-          # pins for trainer/runtime
           pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" "fastapi" "pydantic" "uvicorn[standard]"
 
-      # ======== 0) Sanity: show tree before we start ========
-      - name: Show initial tree (top-level)
+      # --- Hard fail early if Polygon key is missing ---
+      - name: Assert POLYGON_API_KEY is present
         run: |
           set -euo pipefail
-          ls -lah .
-          echo "----"
-          ls -lah "Grond-main 2" || true
+          if [ -z "${POLYGON_API_KEY:-}" ]; then
+            echo "::error::POLYGON_API_KEY is not set in Secrets or Variables."
+            echo "Fix: add Secrets → Actions → POLYGON_API_KEY (preferred) OR a repo Variable named POLYGON_API_KEY."
+            exit 1
+          fi
+          echo "POLYGON_API_KEY detected (value hidden)."
 
-      # ======== 1) Existing prep (NO --out; it writes inside Grond-main 2/data/) ========
+      # ======== 1) Existing prep (uses env POLYGON_API_KEY) ========
       - name: Prepare (existing pipeline)
+        env:
+          POLYGON_API_KEY: ${{ env.POLYGON_API_KEY }}   # <-- ensure it is in the process env
         run: |
           set -euo pipefail
           mkdir -p "Grond-main 2/data" "Grond-main 2/Resources" "artifacts"
+          # many repos read the key via os.environ['POLYGON_API_KEY']; this exports it for the python process
+          export POLYGON_API_KEY
           python "Grond-main 2/prepare_training_data.py"
 
       - name: Verify prepared dataset (subdir path)
@@ -111,7 +120,7 @@ jobs:
           print("Columns:", df.columns.tolist()[:60])
           PY
 
-      # ======== 3) Train + Optuna + per-H calibration (writes bundle+reports to ./artifacts) ========
+      # ======== 3) Train + Optuna + per-H calibration ========
       - name: Train HCBC (XGBoost + Optuna)
         run: |
           set -euo pipefail
@@ -125,7 +134,7 @@ jobs:
             --seed 42
           test -s "${MODEL_BUNDLE}"
 
-      # ======== 4) Publish artifacts (bundle + reports from ./artifacts) ========
+      # ======== 4) Publish artifacts ========
       - name: Upload artifacts (bundle + reports)
         uses: actions/upload-artifact@v4
         with:
@@ -137,7 +146,7 @@ jobs:
             artifacts/hcbc_features.json
           retention-days: 30
 
-      # ======== 5) Configure AWS via OIDC and upload to S3 (uses repo vars) ========
+      # ======== 5) Configure AWS via OIDC and upload to S3 ========
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
