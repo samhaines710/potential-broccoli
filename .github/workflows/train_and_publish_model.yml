@@ -26,6 +26,10 @@ env:
   HCBC_OUT: data/multiH_binary.csv
   MODEL_BUNDLE: Resources/xgb_hcbc.bundle.joblib
 
+  # Provided by your repo env/vars
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ML_MODEL_PATH: ${{ vars.ML_MODEL_PATH }}
+
 jobs:
   train-and-publish:
     runs-on: ubuntu-latest
@@ -50,26 +54,29 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r "Grond-main 2/requirements.txt"
-          # ensure pins for trainer
+          # pins for trainer/runtime
           pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" "fastapi" "pydantic" "uvicorn[standard]"
 
-      # ======== 1) Your existing prep step (unchanged) ========
+      # ======== 1) Existing prep (unchanged) ========
       - name: Prepare (existing pipeline)
         working-directory: "Grond-main 2"
         env:
+          # keep if your prep pulls data via Polygon (else remove)
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: |
+          set -euo pipefail
           mkdir -p data Resources
-          # call your current prep the same way you do today (adjust if your command differs)
-          python prepare_training_data.py --out "${{ env.RAW_PREP_OUT }}"
+          python prepare_training_data.py --out "${RAW_PREP_OUT}"
 
-      - name: Verify existing prepared dataset
+      - name: Verify prepared dataset
         run: |
-          test -s "${{ env.RAW_PREP_OUT }}"
+          set -euo pipefail
+          test -s "${RAW_PREP_OUT}"
           python - << 'PY'
-          import pandas as pd; import os
+          import pandas as pd, os
           p=os.environ["RAW_PREP_OUT"]; df=pd.read_csv(p)
           print("Prepared rows:", len(df)); print(df.columns.tolist()[:40])
           PY
@@ -78,17 +85,18 @@ jobs:
       - name: Convert to binary HCBC dataset
         working-directory: "Grond-main 2"
         run: |
+          set -euo pipefail
           python prepare_hcbc_dataset.py \
-            --in "${{ env.RAW_PREP_OUT }}" \
-            --out "${{ env.HCBC_OUT }}" \
+            --in "${RAW_PREP_OUT}" \
+            --out "${HCBC_OUT}" \
             --h 2 \
             --drop-neutral
-          test -s "${{ env.HCBC_OUT }}"
+          test -s "${HCBC_OUT}"
 
       - name: Show HCBC head
         run: |
           python - << 'PY'
-          import pandas as pd; import os
+          import pandas as pd, os
           p=os.environ["HCBC_OUT"]; df=pd.read_csv(p)
           print(df.head(5).to_string())
           print("Columns:", df.columns.tolist()[:60])
@@ -96,17 +104,17 @@ jobs:
 
       # ======== 3) Train + Optuna + calibration ========
       - name: Train HCBC (XGBoost + Optuna)
-        working-directory: "."
         run: |
+          set -euo pipefail
           mkdir -p "Grond-main 2/Resources"
           python "audit_fixes/train_hcbc_xgb_optuna.py" \
-            --data "${{ env.HCBC_OUT }}" \
-            --out "${{ env.MODEL_BUNDLE }}" \
+            --data "${HCBC_OUT}" \
+            --out "${MODEL_BUNDLE}" \
             --n-trials "${{ github.event.inputs.n_trials || 40 }}" \
             --folds "${{ github.event.inputs.folds || 6 }}" \
             --embargo-rows "${{ github.event.inputs.embargo_rows || 200 }}" \
             --seed 42
-          test -s "${{ env.MODEL_BUNDLE }}"
+          test -s "${MODEL_BUNDLE}"
 
       # ======== 4) Publish artifacts ========
       - name: Upload artifacts (bundle + reports)
@@ -114,24 +122,23 @@ jobs:
         with:
           name: hcbc_model_bundle
           path: |
-            ${{ env.MODEL_BUNDLE }}
-            Grond-main 2/Resources/hcbc_cv_report.json
-            Grond-main 2/Resources/hcbc_thresholds.json
-            Grond-main 2/Resources/hcbc_features.json
+            "${{ env.MODEL_BUNDLE }}"
+            "Grond-main 2/Resources/hcbc_cv_report.json"
+            "Grond-main 2/Resources/hcbc_thresholds.json"
+            "Grond-main 2/Resources/hcbc_features.json"
           retention-days: 30
 
-      # Optional S3 publish using OIDC role (if you already had this configured)
-      - name: Configure AWS (optional)
-        if: ${{ secrets.AWS_ROLE_ARN != '' }}
+      # ======== 5) Configure AWS via OIDC (no secrets in if:) ========
+      - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+          # Use the same role you already use for OIDC in this repo
+          role-to-assume: arn:aws:iam::719070647059:role/tigermoon
+          aws-region: ${{ env.AWS_REGION || 'us-east-1' }}
 
-      - name: Upload to S3 (optional)
-        if: ${{ secrets.S3_MODEL_URI != '' }}
+      - name: Upload model to S3 (ML_MODEL_PATH)
+        if: ${{ env.ML_MODEL_PATH }}
         run: |
-          aws s3 cp "${{ env.MODEL_BUNDLE }}" "${{ secrets.S3_MODEL_URI }}" --only-show-errors || true
-          aws s3 cp "Grond-main 2/Resources/hcbc_cv_report.json"      "${{ secrets.S3_REPORTS_PREFIX }}/hcbc_cv_report.json" --only-show-errors || true
-          aws s3 cp "Grond-main 2/Resources/hcbc_thresholds.json"     "${{ secrets.S3_REPORTS_PREFIX }}/hcbc_thresholds.json" --only-show-errors || true
-          aws s3 cp "Grond-main 2/Resources/hcbc_features.json"       "${{ secrets.S3_REPORTS_PREFIX }}/hcbc_features.json" --only-show-errors || true
+          set -euo pipefail
+          echo "Uploading model to ${ML_MODEL_PATH}"
+          aws s3 cp "${MODEL_BUNDLE}" "${ML_MODEL_PATH}" --only-show-errors
