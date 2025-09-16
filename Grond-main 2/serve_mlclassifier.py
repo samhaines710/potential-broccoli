@@ -1,65 +1,47 @@
-"""
-FastAPI app exposing inference endpoints backed by MLClassifier (binary).
-
-Endpoints:
-- GET  /          -> service/version
-- GET  /health    -> liveness
-- GET  /ready     -> readiness
-- POST /predict   -> { features: {...} } → { p_up, movement_type, top_contributions }
-"""
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
-import logging
-from typing import Any, Dict
+from typing import Dict, Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from ml_classifier import MLClassifier
-from utils.feature_sanitizer import sanitize_features
+from ml_classifier import HCBCClassifier
 
-LOG = logging.getLogger("serve_mlclassifier")
+BUNDLE_PATH = os.environ.get("ML_MODEL_PATH", "Resources/xgb_hcbc.bundle.joblib")
 
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
+app = FastAPI(title="HCBC Inference API", version="1.0")
 
-app = FastAPI(title="Grond ML API", version=SERVICE_VERSION)
-
-# Load classifier once
-try:
-    classifier = MLClassifier(os.getenv("ML_MODEL_PATH"))
-    LOG.info("MLClassifier loaded successfully.")
-except Exception as e:
-    LOG.error("Failed to initialize MLClassifier: %r", e)
-    raise
-
-
-class PredictIn(BaseModel):
+class ScoreRequest(BaseModel):
+    H: int
     features: Dict[str, Any]
 
+class ScoreResponse(BaseModel):
+    p_up: float
+    decision: str
+    H: int
+    thresholds: Dict[str, float]
 
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {"service": "grond-ml", "version": SERVICE_VERSION}
-
-
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    return {"status": "ok"}
-
-
-@app.get("/ready")
-def ready() -> Dict[str, Any]:
-    return {"ready": True}
-
-
-@app.post("/predict")
-def predict(body: PredictIn) -> Dict[str, Any]:
+@app.on_event("startup")
+def _load_model():
+    global clf
     try:
-        clean = sanitize_features(body.features)
-        out = classifier.classify(clean)
-        return out
+        clf = HCBCClassifier(BUNDLE_PATH)
     except Exception as e:
-        LOG.exception("Prediction failed: %s", e)
+        raise RuntimeError(f"Failed to load model: {e}")
+
+@app.post("/score", response_model=ScoreResponse)
+def score(req: ScoreRequest):
+    if req.H <= 0:
+        raise HTTPException(status_code=422, detail="H must be positive integer")
+    try:
+        r = clf.score(req.features, int(req.H))
+        return ScoreResponse(p_up=r.p_up, decision=r.decision, H=r.H, thresholds=r.thresholds)
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/healthz")
+def health():
+    return {"status": "ok"}
