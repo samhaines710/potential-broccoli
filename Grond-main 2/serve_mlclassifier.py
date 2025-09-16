@@ -1,60 +1,65 @@
-#!/usr/bin/env python3
+"""
+FastAPI app exposing inference endpoints backed by MLClassifier (binary).
+
+Endpoints:
+- GET  /          -> service/version
+- GET  /health    -> liveness
+- GET  /ready     -> readiness
+- POST /predict   -> { features: {...} } → { p_up, movement_type, top_contributions }
+"""
+
+from __future__ import annotations
+
 import os
 import logging
+from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import uvicorn
 
 from ml_classifier import MLClassifier
+from utils.feature_sanitizer import sanitize_features
 
-# Configure logging
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(module)s %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+LOG = logging.getLogger("serve_mlclassifier")
 
-# Environment-driven settings
-MODEL_PATH = os.getenv(
-    "ML_MODEL_PATH", "/app/models/xgb_classifier.pipeline.joblib"
-)
-API_PORT = int(os.getenv("API_PORT", "9000"))
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
 
-# Load classifier once at startup
+app = FastAPI(title="Grond ML API", version=SERVICE_VERSION)
+
+# Load classifier once
 try:
-    logger.info(f"Loading MLClassifier from {MODEL_PATH}")
-    classifier = MLClassifier(MODEL_PATH)
-    logger.info("MLClassifier loaded successfully.")
+    classifier = MLClassifier(os.getenv("ML_MODEL_PATH"))
+    LOG.info("MLClassifier loaded successfully.")
 except Exception as e:
-    logger.error(f"Failed to initialize MLClassifier: {e!r}")
+    LOG.error("Failed to initialize MLClassifier: %r", e)
     raise
 
-# Build FastAPI app
-app = FastAPI(title="Movement Classification Service")
+
+class PredictIn(BaseModel):
+    features: Dict[str, Any]
 
 
-class PredictRequest(BaseModel):
-    data: dict
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {"service": "grond-ml", "version": SERVICE_VERSION}
 
 
-class PredictResponse(BaseModel):
-    movement_type: str
-    expected_move_pct: float
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"status": "ok"}
 
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
-    """
-    Accepts JSON { "data": { feature_name: value, ... } }
-    Returns predicted movement_type and expected_move_pct.
-    """
+@app.get("/ready")
+def ready() -> Dict[str, Any]:
+    return {"ready": True}
+
+
+@app.post("/predict")
+def predict(body: PredictIn) -> Dict[str, Any]:
     try:
-        result = classifier.classify(req.data)
-        return result
+        clean = sanitize_features(body.features)
+        out = classifier.classify(clean)
+        return out
     except Exception as e:
-        logger.error(f"Prediction error: {e!r}")
+        LOG.exception("Prediction failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=API_PORT)
