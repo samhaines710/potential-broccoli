@@ -1,4 +1,4 @@
-name: Train & Publish HCBC Model
+name: Train & Publish HCBC Model (Polygon required, CI env)
 
 on:
   workflow_dispatch:
@@ -23,21 +23,20 @@ permissions:
 env:
   PYTHONUNBUFFERED: "1"
 
-  # Canonical locations
+  # Paths
   RAW_PREP_OUT: Grond-main 2/data/movement_training_data.csv
   HCBC_OUT: artifacts/multiH_binary.csv
   MODEL_BUNDLE: artifacts/xgb_hcbc.bundle.joblib
 
-  # Repo vars (non-secret)
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ML_MODEL_PATH: ${{ vars.ML_MODEL_PATH }}
-
-  # Prefer secret; fallback to repo variable if you keep it there
-  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY != '' && secrets.POLYGON_API_KEY || vars.POLYGON_API_KEY }}
+  # Pull from the CI environment's secrets
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ML_MODEL_PATH: ${{ secrets.ML_MODEL_PATH }}
+  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
 
 jobs:
   train-and-publish:
     runs-on: ubuntu-latest
+    environment: CI            # <-- this grants access to CI environment secrets
     timeout-minutes: 360
 
     steps:
@@ -62,31 +61,29 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r "Grond-main 2/requirements.txt"
-          pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" "fastapi" "pydantic" "uvicorn[standard]"
+          pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" "fastapi" "pydantic" "uvicorn[standard]" "pandas" "numpy"
 
-      # --- Hard fail early if Polygon key is missing ---
+      # Fail early if Polygon key is missing
       - name: Assert POLYGON_API_KEY is present
         run: |
           set -euo pipefail
           if [ -z "${POLYGON_API_KEY:-}" ]; then
-            echo "::error::POLYGON_API_KEY is not set in Secrets or Variables."
-            echo "Fix: add Secrets → Actions → POLYGON_API_KEY (preferred) OR a repo Variable named POLYGON_API_KEY."
+            echo "::error::POLYGON_API_KEY is not set in the CI environment."
             exit 1
           fi
-          echo "POLYGON_API_KEY detected (value hidden)."
+          echo "POLYGON_API_KEY detected (hidden)."
 
-      # ======== 1) Existing prep (uses env POLYGON_API_KEY) ========
-      - name: Prepare (existing pipeline)
+      # 1) Prepare using Polygon (your existing script writes under Grond-main 2/data/)
+      - name: Prepare (existing pipeline; requires Polygon)
         env:
-          POLYGON_API_KEY: ${{ env.POLYGON_API_KEY }}   # <-- ensure it is in the process env
+          POLYGON_API_KEY: ${{ env.POLYGON_API_KEY }}   # ensure child process sees it
         run: |
           set -euo pipefail
           mkdir -p "Grond-main 2/data" "Grond-main 2/Resources" "artifacts"
-          # many repos read the key via os.environ['POLYGON_API_KEY']; this exports it for the python process
           export POLYGON_API_KEY
           python "Grond-main 2/prepare_training_data.py"
 
-      - name: Verify prepared dataset (subdir path)
+      - name: Verify prepared dataset
         run: |
           set -euo pipefail
           ls -lah "Grond-main 2/data" || true
@@ -98,7 +95,7 @@ jobs:
           print(df.columns.tolist()[:40])
           PY
 
-      # ======== 2) Convert to HCBC schema (binary + H) into ./artifacts ========
+      # 2) Convert to HCBC schema (binary label_up + H)
       - name: Convert to binary HCBC dataset
         run: |
           set -euo pipefail
@@ -120,7 +117,7 @@ jobs:
           print("Columns:", df.columns.tolist()[:60])
           PY
 
-      # ======== 3) Train + Optuna + per-H calibration ========
+      # 3) Train + Optuna + per-H calibration
       - name: Train HCBC (XGBoost + Optuna)
         run: |
           set -euo pipefail
@@ -134,7 +131,7 @@ jobs:
             --seed 42
           test -s "${MODEL_BUNDLE}"
 
-      # ======== 4) Publish artifacts ========
+      # 4) Publish artifacts
       - name: Upload artifacts (bundle + reports)
         uses: actions/upload-artifact@v4
         with:
@@ -146,7 +143,7 @@ jobs:
             artifacts/hcbc_features.json
           retention-days: 30
 
-      # ======== 5) Configure AWS via OIDC and upload to S3 ========
+      # 5) Configure AWS (OIDC) and upload to S3
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
