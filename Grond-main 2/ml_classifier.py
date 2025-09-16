@@ -1,377 +1,208 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-ML Classifier for movement_type prediction.
+Binary ML classifier wrapper for live inference.
 
-Key hardening for NumPy 2.0 / scikit-learn OneHotEncoder:
-- Safe np.isnan shim: returns False for non-numeric/object arrays instead of raising TypeError.
-- Strict column alignment to pipeline.feature_names_in_ (if present) without boolean-evaluating arrays.
-- Deterministic filling for missing inputs (incl. categorical 'symbol', 'source', 'time_of_day').
-- Returns both 'movement_type' and class 'probs' in [CALL, PUT, NEUTRAL] order.
+- Expects a persisted sklearn Pipeline with an XGBClassifier as the final step.
+- Computes p_up and maps to CALL/PUT/NEUTRAL via thresholds (policy).
+- Logs model summary and per-instance top feature contributions via XGBoost TreeSHAP.
 
-Environment:
-- MODEL_URI (e.g., s3://bucket/path/model.joblib)
-- AWS creds via standard env if MODEL_URI is s3://
+Env:
+  ML_MODEL_PATH=/app/models/xgb_classifier.pipeline.joblib
+  TAU_BUY=0.60
+  TAU_SELL=0.40
+  LOG_FEATURE_CONTRIBS_TOP_N=8
 """
 
 from __future__ import annotations
 
-import io
 import os
-import re
+import logging
 from typing import Any, Dict, List, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 
-# Optional boto3 (only required if using s3:// MODEL_URI)
-try:  # pragma: no cover
-    import boto3  # type: ignore
-except Exception:  # pragma: no cover
-    boto3 = None  # type: ignore
+LOG = logging.getLogger("ml_classifier")
 
-from utils.logging_utils import get_logger, write_status, configure_logging
+MODEL_PATH = os.getenv("ML_MODEL_PATH", "/app/models/xgb_classifier.pipeline.joblib")
 
-# Ensure logging once
-configure_logging()
-logger = get_logger(__name__)
+# Threshold policy (binary → tri-action)
+TAU_BUY  = float(os.getenv("TAU_BUY",  "0.60"))
+TAU_SELL = float(os.getenv("TAU_SELL", "0.40"))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# NumPy isnan shim (NumPy 2.0 object/string arrays raise TypeError)
-# ──────────────────────────────────────────────────────────────────────────────
-
-try:
-    _orig_isnan = np.isnan  # type: ignore[attr-defined]
-except Exception:
-    _orig_isnan = None  # type: ignore
+TOP_N = int(os.getenv("LOG_FEATURE_CONTRIBS_TOP_N", "8"))
 
 
-def _isnan_safe(x: Any):
-    """Return isnan(x) when x is numeric; for object/string inputs return False/zeros."""
-    if _orig_isnan is None:
-        if isinstance(x, np.ndarray):
-            return np.zeros(x.shape, dtype=bool)
-        return False
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _safe_get_final_estimator(pipeline) -> Any:
     try:
-        return _orig_isnan(x)  # works for numeric arrays and scalars
-    except TypeError:
-        if isinstance(x, np.ndarray):
-            return np.zeros(x.shape, dtype=bool)
-        return False
+        from sklearn.pipeline import Pipeline
+        if isinstance(pipeline, Pipeline):
+            return pipeline.steps[-1][1]
+        return pipeline
+    except Exception:
+        return pipeline
 
 
-# Monkey-patch numpy.isnan in-process (safe for our runtime)
-np.isnan = _isnan_safe  # type: ignore
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Labels
-# ──────────────────────────────────────────────────────────────────────────────
-
-CALL_LABEL = "CALL"
-PUT_LABEL = "PUT"
-NEU_LABEL = "NEUTRAL"
-ORDERED_LABELS = [CALL_LABEL, PUT_LABEL, NEU_LABEL]
-
-# ──────────────────────────────────────────────────────────────────────────────
-# S3 helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _parse_s3_uri(uri: str) -> Tuple[str, str]:
-    m = re.match(r"^s3://([^/]+)/(.+)$", uri)
-    if not m:
-        raise ValueError(f"Invalid S3 URI: {uri}")
-    return m.group(1), m.group(2)
-
-
-def _download_from_s3(s3_uri: str) -> bytes:
-    if boto3 is None:
-        raise RuntimeError("boto3 is not available but an s3:// MODEL_URI was provided.")
-    bucket, key = _parse_s3_uri(s3_uri)
-    write_status(f"Downloading model from {s3_uri}")
-    s3 = boto3.client("s3")
-    buf = io.BytesIO()
-    s3.download_fileobj(bucket, key, buf)
-    buf.seek(0)
-    write_status("Model downloaded successfully.")
-    return buf.read()
-
-
-def _load_pipeline(model_uri: str):
-    write_status(f"Loading ML pipeline from {model_uri}")
-    if model_uri.startswith("s3://"):
-        data = _download_from_s3(model_uri)
-        obj = joblib.load(io.BytesIO(data))
-    else:
-        obj = joblib.load(model_uri)
-    # unwrap bundle if saved as dict
-    if isinstance(obj, dict) and "model" in obj:
-        pipe = obj["model"]
-    else:
-        pipe = obj
-    write_status("ML pipeline loaded successfully.")
-    return pipe
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Feature-frame utilities
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _coerce_val(v: Any) -> Any:
-    """Try to coerce numerics to float; leave strings as str; fallback safe."""
-    if v is None:
-        return np.nan
-    if isinstance(v, (int, float, np.integer, np.floating)):
-        return float(v)
-    if isinstance(v, (bool, np.bool_)):
-        return float(bool(v))
-    return str(v)
-
-
-def _ensure_frame(features: Dict[str, Any]) -> pd.DataFrame:
-    """Build a one-row DataFrame with coerced values."""
-    row = {k: _coerce_val(v) for k, v in features.items()}
-    return pd.DataFrame([row])
-
-
-def _expected_features_for_pipeline(pipeline, df_cols) -> List[str]:
-    """
-    Determine the expected feature order for the pipeline without evaluating
-    any ndarray in a boolean context (avoids ambiguous truth-value errors).
-    """
-    # 1) Try pipeline-level attribute
-    feat = getattr(pipeline, "feature_names_in_", None)
-    if feat is not None:
-        try:
-            return list(feat)
-        except Exception:
-            pass
-
-    # 2) Try step-level attributes (e.g., preprocessor/ColumnTransformer)
+def _get_preprocessor(pipeline):
     try:
-        steps = getattr(pipeline, "steps", None)
-        if steps:
-            for _, step in steps:
-                step_feat = getattr(step, "feature_names_in_", None)
-                if step_feat is not None:
-                    try:
-                        return list(step_feat)
-                    except Exception:
-                        continue
+        from sklearn.pipeline import Pipeline
+        if isinstance(pipeline, Pipeline):
+            if len(pipeline.steps) >= 2:
+                return Pipeline(pipeline.steps[:-1])
     except Exception:
         pass
-
-    # 3) Fallback: current DataFrame columns
-    return list(df_cols)
+    return None
 
 
-def _align_columns_for_pipeline(df: pd.DataFrame, pipeline) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Reindex df to match pipeline expected features.
-    Fill known missing fields deterministically.
-    Returns (df_aligned, filled_cols_list).
-    """
-    filled: List[str] = []
-    expected = _expected_features_for_pipeline(pipeline, df.columns)
-
-    DEFAULTS: Dict[str, Any] = {
-        # categorical
-        "symbol": "UNKNOWN",
-        "source": "fallback",
-        "time_of_day": "MIDDAY",
-        # numeric defaults
-        "breakout_prob": 0.0,
-        "recent_move_pct": 0.0,
-        "volume_ratio": 1.0,
-        "rsi": 50.0,
-        "corr_dev": 0.0,
-        "skew_ratio": 1.0,
-        "yield_spike_2year": 0.0,
-        "yield_spike_10year": 0.0,
-        "yield_spike_30year": 0.0,
-        "delta": 0.0,
-        "gamma": 0.0,
-        "theta": 0.0,
-        "vega": 0.0,
-        "rho": 0.0,
-        "vanna": 0.0,
-        "vomma": 0.0,
-        "charm": 0.0,
-        "veta": 0.0,
-        "speed": 0.0,
-        "zomma": 0.0,
-        "color": 0.0,
-        "implied_volatility": 0.0,
-        "theta_day": 0.0,
-        "theta_5m": 0.0,
-        # microstructure fields that may be absent in some payloads
-        "ms_spread_mean": 0.0,
-        "ms_depth_imbalance_mean": 0.0,
-        "ms_ofi_sum": 0.0,
-        "ms_signed_volume_sum": 0.0,
-        "ms_vpin": 0.0,
-    }
-
-    for col in expected:
-        if col not in df.columns:
-            df[col] = DEFAULTS.get(col, 0.0)
-            filled.append(col)
-
-    df = df.reindex(columns=expected)
-
-    # Ensure categorical dtype→str to avoid encoder issues
-    for cat_col in ("symbol", "source", "time_of_day"):
-        if cat_col in df.columns:
-            df[cat_col] = df[cat_col].astype(str)
-
-    if filled:
-        write_status(f"Filled missing model inputs with defaults: {filled}")
-
-    return df, filled
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Class/label utilities
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _map_class_index_to_label(classes: np.ndarray, idx: int) -> str:
-    """Map estimator.classes_ value at index idx to canonical label."""
-    val = classes[idx]
+def _get_feature_names(pre, X_one: pd.DataFrame) -> List[str]:
     try:
-        ival = int(val)
-        mapping = {0: CALL_LABEL, 1: PUT_LABEL, 2: NEU_LABEL}
-        if ival in mapping:
-            return mapping[ival]
+        # sklearn >=1.0
+        names = pre.get_feature_names_out()
+        return list(names)
     except Exception:
-        pass
-    sval = str(val).upper()
-    if sval in {CALL_LABEL, PUT_LABEL, NEU_LABEL}:
-        return sval
-    return NEU_LABEL
-
-
-def _probs_canonical(classes: np.ndarray, proba_row: np.ndarray) -> List[float]:
-    """
-    Return probabilities in [CALL, PUT, NEUTRAL] order, robust to:
-      - binary models (2 columns) with/without NEUTRAL in classes_
-      - inconsistent classes_ vs predict_proba shape (index out of range)
-      - any missing label -> treated as 0
-    If NEUTRAL is unavailable, we renormalize CALL/PUT to sum to 1 and set NEUTRAL=0.
-    """
-    classes = np.asarray(classes)
-    proba = np.asarray(proba_row).ravel()
-    n = proba.shape[0]
-
-    # map label -> column index (may include NEUTRAL even if proba has only 2 cols)
-    idx = {str(c).upper(): i for i, c in enumerate(classes)}
-
-    def grab(label: str) -> float:
-        j = idx.get(label)
-        if j is None or j < 0 or j >= n:
-            return 0.0
-        try:
-            return float(proba[j])
-        except Exception:
-            arr = np.asarray(proba[j])
-            return float(arr.item()) if arr.size == 1 else 0.0
-
-    p_call = grab("CALL")
-    p_put = grab("PUT")
-    p_neu = grab("NEUTRAL")
-
-    neu_missing_or_oob = ("NEUTRAL" not in idx) or (idx.get("NEUTRAL", -1) >= n)
-    if neu_missing_or_oob:
-        s2 = p_call + p_put
-        if s2 > 0:
-            return [p_call / s2, p_put / s2, 0.0]
-        return [0.5, 0.5, 0.0]
-
-    s3 = p_call + p_put + p_neu
-    if s3 > 0:
-        return [p_call / s3, p_put / s3, p_neu / s3]
-    return [1.0 / 3, 1.0 / 3, 1.0 / 3]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Public classifier
-# ──────────────────────────────────────────────────────────────────────────────
+        # fallback to original columns if preprocessor does nothing
+        return list(X_one.columns)
 
 
 class MLClassifier:
     def __init__(self, model_path: str | None = None) -> None:
-        model_uri = model_path or os.getenv("MODEL_URI", "s3://bucketbuggypie/models/xgb_classifier.pipeline.joblib")
-        self.pipeline = _load_pipeline(model_uri)
+        path = model_path or MODEL_PATH
+        LOG.info("Loading ML pipeline from %s", path)
+        self.pipeline = joblib.load(path)  # persisted sklearn Pipeline (preprocess + XGBClassifier)
+        LOG.info("ML pipeline loaded successfully.")
+
+        self.pre = _get_preprocessor(self.pipeline)
+        self.final_est = _safe_get_final_estimator(self.pipeline)
+
+        # Summarize model
+        try:
+            final_name = self.final_est.__class__.__name__
+        except Exception:
+            final_name = str(type(self.final_est))
+        LOG.info("Model summary: final_estimator=%s", final_name)
+
+        # Warn if not using XGBoost
+        try:
+            import xgboost as xgb  # noqa: F401
+            have_xgb = True
+        except Exception:
+            have_xgb = False
+        if not have_xgb:
+            LOG.warning("XGBoost not importable; ensure xgboost is installed.")
+        if have_xgb and "XGB" not in final_name:
+            LOG.warning("Final estimator is not XGB* (%s). Consider retraining with XGBClassifier.", final_name)
+
+    # ---- binary decision policy ------------------------------------------------
+
+    @staticmethod
+    def _movement_from_p_up(p_up: float) -> str:
+        if p_up >= TAU_BUY:
+            return "CALL"
+        if p_up <= TAU_SELL:
+            return "PUT"
+        return "NEUTRAL"
+
+    # ---- per-instance feature contributions -----------------------------------
+
+    def _instance_contribs(self, X_proc: np.ndarray, feat_names: List[str]) -> List[Tuple[str, float]]:
+        """Return top-N absolute contributions (name, value) excluding bias term."""
+        try:
+            import xgboost as xgb
+        except Exception:
+            return []
+
+        try:
+            # Prefer sklearn API direct pred_contribs if supported
+            if hasattr(self.final_est, "predict"):
+                try:
+                    contribs = self.final_est.predict(X_proc, pred_contribs=True)
+                except TypeError:
+                    # Use booster with DMatrix
+                    booster = self.final_est.get_booster()
+                    dmat = xgb.DMatrix(X_proc)
+                    contribs = booster.predict(dmat, pred_contribs=True)
+            else:
+                booster = self.final_est.get_booster()
+                dmat = xgb.DMatrix(X_proc)
+                contribs = booster.predict(dmat, pred_contribs=True)
+
+            # contribs shape: (n_samples, n_features + 1 bias)
+            row = contribs[0]
+            if len(row) == len(feat_names) + 1:
+                vals = row[:-1]  # drop bias term
+            else:
+                vals = row
+
+            pairs = list(zip(feat_names, vals))
+            pairs.sort(key=lambda kv: abs(kv[1]), reverse=True)
+            return pairs[:max(1, TOP_N)]
+        except Exception as e:
+            LOG.warning("Could not compute per-instance contributions: %s", e)
+            # fallback: use feature_importances_ if available (global, not per-instance)
+            try:
+                importances = getattr(self.final_est, "feature_importances_", None)
+                if importances is not None and len(importances) == X_proc.shape[1]:
+                    pairs = list(zip(feat_names, importances))
+                    pairs.sort(key=lambda kv: abs(kv[1]), reverse=True)
+                    return pairs[:max(1, TOP_N)]
+            except Exception:
+                pass
+            return []
+
+    # ---- public classify API ---------------------------------------------------
 
     def classify(self, features: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Classify a single feature dict.
-        Returns:
-            {
-              "movement_type": "CALL"|"PUT"|"NEUTRAL",
-              "probs": [p_call, p_put, p_neutral],
-              "expected_move_pct": float
-            }
-        """
-        df = _ensure_frame(features)
-        df, _ = _align_columns_for_pipeline(df, self.pipeline)
+        """Return dict with p_up, movement_type, and top feature contributions."""
+        # Build single-row DataFrame
+        df = pd.DataFrame([features])
 
-        # Predict probabilities (try predict_proba; fallback to calibrated pseudoprobs)
+        # Transform through preprocessor (if any)
+        if self.pre is not None:
+            X_proc = self.pre.transform(df)
+            feat_names = _get_feature_names(self.pre, df)
+        else:
+            # Pipeline is just estimator on raw columns
+            X_proc = df.values
+            feat_names = list(df.columns)
+
+        # Predict probability of UP
+        p: float
         try:
-            proba = self.pipeline.predict_proba(df)[0]
-        except AttributeError:
-            if hasattr(self.pipeline, "decision_function"):
-                scores = np.asarray(self.pipeline.decision_function(df))[0]
-                exp = np.exp(scores - np.max(scores))
-                proba = exp / np.sum(exp)
-            else:
-                pred = self.pipeline.predict(df)[0]
-                # one-hot fallback
-                final_est = getattr(self.pipeline, "steps", [[None, None]])[-1][1]
-                classes_fe = getattr(final_est, "classes_", np.array(["CALL", "PUT", "NEUTRAL"]))
-                proba = np.zeros(len(classes_fe), dtype=float)
-                try:
-                    idx = int(np.where(classes_fe == pred)[0][0])
-                    proba[idx] = 1.0
-                except Exception:
-                    proba = np.array([0.0, 0.0, 1.0], dtype=float)
-
-        # Obtain classes_ from the final estimator (canonical location)
-        final_est = getattr(self.pipeline, "steps", [[None, None]])[-1][1]
-        classes = getattr(final_est, "classes_", np.array(["CALL", "PUT", "NEUTRAL"]))
-
-        # Canonicalize probabilities into [CALL, PUT, NEUTRAL]
-        probs = _probs_canonical(np.asarray(classes), np.asarray(proba))
-
-        # Argmax on canonical order yields the final label
-        label_idx = int(np.argmax(probs))
-        label = ["CALL", "PUT", "NEUTRAL"][label_idx]
-
-        # Provide a stable float for downstream consumers (simple heuristic)
-        expected_move_pct = float(0.5 * probs[0] + 0.5 * probs[1])
-
-        return {"movement_type": label, "probs": probs, "expected_move_pct": expected_move_pct}
-
-    @property
-    def feature_names(self) -> List[str]:
-        # derive expected feature order from pipeline safely
-        try:
-            steps = getattr(self.pipeline, "steps", None)
-            if steps:
-                for _, step in steps:
-                    if hasattr(step, "get_feature_names_out"):
-                        return list(step.get_feature_names_out())
+            # Try standard predict_proba
+            proba = self.pipeline.predict_proba(df)  # pipeline handles pre + est
+            # Expect binary: [:,1] is UP
+            p = float(proba[0, 1])
         except Exception:
-            pass
-        # fallback to union of known numeric + categorical names
-        return [
-            "breakout_prob", "recent_move_pct", "volume_ratio", "rsi", "corr_dev", "skew_ratio",
-            "yield_spike_2year", "yield_spike_10year", "yield_spike_30year",
-            "delta", "gamma", "theta", "vega", "rho", "vanna", "vomma", "charm", "veta",
-            "speed", "zomma", "color", "implied_volatility", "theta_day", "theta_5m",
-            "ms_spread_mean", "ms_depth_imbalance_mean", "ms_ofi_sum", "ms_signed_volume_sum", "ms_vpin",
-            "symbol", "time_of_day", "source"
-        ]
+            # Some wrappers expose decision_function or raw score
+            try:
+                score = float(self.pipeline.decision_function(df)[0])
+                p = float(_sigmoid(np.array([score]))[0])
+            except Exception as e:
+                LOG.warning("Fallback scoring path: %s", e)
+                # Last resort: est.predict returns {0,1}
+                pred = int(self.pipeline.predict(df)[0])
+                p = 0.9 if pred == 1 else 0.1  # heuristic
+
+        movement = MLClassifier._movement_from_p_up(p)
+
+        # Per-instance contributions (needs processed matrix)
+        contribs = self._instance_contribs(
+            X_proc=X_proc if isinstance(X_proc, np.ndarray) else X_proc.toarray(),
+            feat_names=feat_names,
+        )
+        # Log a clear trading decision line
+        LOG.info(
+            "Decision: p_up=%.4f → movement=%s (tau_buy=%.2f, tau_sell=%.2f) | top=%s",
+            p, movement, TAU_BUY, TAU_SELL,
+            ", ".join(f"{k}:{v:+.3f}" for k, v in contribs),
+        )
+
+        return {
+            "p_up": p,
+            "movement_type": movement,
+            "top_contributions": [{"feature": k, "contribution": float(v)} for k, v in contribs],
+        }
