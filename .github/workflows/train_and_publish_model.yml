@@ -1,4 +1,4 @@
-name: Train & Publish HCBC Model (Polygon required, CI env)
+name: Train & Publish HCBC Model (Polygon required, CI env, auto-discover prep CSV)
 
 on:
   workflow_dispatch:
@@ -23,12 +23,11 @@ permissions:
 env:
   PYTHONUNBUFFERED: "1"
 
-  # Paths
-  RAW_PREP_OUT: Grond-main 2/data/movement_training_data.csv
+  # Downstream artifact paths
   HCBC_OUT: artifacts/multiH_binary.csv
   MODEL_BUNDLE: artifacts/xgb_hcbc.bundle.joblib
 
-  # Pull from the CI environment's secrets
+  # CI environment-scoped secrets
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ML_MODEL_PATH: ${{ secrets.ML_MODEL_PATH }}
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
@@ -36,7 +35,7 @@ env:
 jobs:
   train-and-publish:
     runs-on: ubuntu-latest
-    environment: CI            # <-- this grants access to CI environment secrets
+    environment: CI
     timeout-minutes: 360
 
     steps:
@@ -61,9 +60,10 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r "Grond-main 2/requirements.txt"
-          pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" "fastapi" "pydantic" "uvicorn[standard]" "pandas" "numpy"
+          pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" \
+                      "fastapi" "pydantic" "uvicorn[standard]" "pandas" "numpy"
 
-      # Fail early if Polygon key is missing
+      # ----- Hard fail if Polygon key missing -----
       - name: Assert POLYGON_API_KEY is present
         run: |
           set -euo pipefail
@@ -73,8 +73,8 @@ jobs:
           fi
           echo "POLYGON_API_KEY detected (hidden)."
 
-      # 1) Prepare using Polygon (your existing script writes under Grond-main 2/data/)
-      - name: Prepare (existing pipeline; requires Polygon)
+      # ======== 1) Prepare (existing pipeline; requires Polygon) ========
+      - name: Prepare dataset with Polygon
         env:
           POLYGON_API_KEY: ${{ env.POLYGON_API_KEY }}   # ensure child process sees it
         run: |
@@ -83,22 +83,53 @@ jobs:
           export POLYGON_API_KEY
           python "Grond-main 2/prepare_training_data.py"
 
-      - name: Verify prepared dataset
+      # ======== 1b) Auto-discover the CSV your prep produced ========
+      - name: Discover prepared CSV path
+        id: discover_csv
         run: |
           set -euo pipefail
-          ls -lah "Grond-main 2/data" || true
+          echo "Searching for the newest CSV under 'Grond-main 2/'..."
+          python - << 'PY'
+          import os, glob, json
+          root = "Grond-main 2"
+          # Prefer names that look like training outputs
+          preferred = [
+              "*movement*training*data*.csv", "*movement*training*.csv",
+              "*training*data*.csv", "*prepared*.csv", "*training*.csv", "*.csv"
+          ]
+          candidates = []
+          for pat in preferred:
+              candidates.extend(glob.glob(os.path.join(root, "**", pat), recursive=True))
+              if candidates:
+                  break  # stop at first pattern that yields results
+          if not candidates:
+              raise SystemExit("::error::No CSV files found under 'Grond-main 2/'.")
+          # Pick newest by mtime
+          newest = max(candidates, key=lambda p: os.path.getmtime(p))
+          print(f"Discovered CSV: {newest}")
+          # Export for later steps
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"RAW_PREP_OUT={newest}\n")
+          PY
+
+      - name: Verify prepared dataset (discovered path)
+        run: |
+          set -euo pipefail
+          echo "RAW_PREP_OUT=${RAW_PREP_OUT}"
           test -s "${RAW_PREP_OUT}"
           python - << 'PY'
           import pandas as pd, os
           p=os.environ["RAW_PREP_OUT"]; df=pd.read_csv(p)
           print("Prepared rows:", len(df))
-          print(df.columns.tolist()[:40])
+          print("Columns (first 40):", df.columns.tolist()[:40])
+          print(df.head(3).to_string())
           PY
 
-      # 2) Convert to HCBC schema (binary label_up + H)
+      # ======== 2) Convert to HCBC schema (binary label_up + H) ========
       - name: Convert to binary HCBC dataset
         run: |
           set -euo pipefail
+          mkdir -p artifacts
           python "Grond-main 2/prepare_hcbc_dataset.py" \
             --in "${RAW_PREP_OUT}" \
             --out "${HCBC_OUT}" \
@@ -114,10 +145,10 @@ jobs:
           import pandas as pd, os
           p=os.environ["HCBC_OUT"]; df=pd.read_csv(p)
           print(df.head(5).to_string())
-          print("Columns:", df.columns.tolist()[:60])
+          print("HCBC columns:", df.columns.tolist())
           PY
 
-      # 3) Train + Optuna + per-H calibration
+      # ======== 3) Train + Optuna + per-H calibration ========
       - name: Train HCBC (XGBoost + Optuna)
         run: |
           set -euo pipefail
@@ -131,7 +162,7 @@ jobs:
             --seed 42
           test -s "${MODEL_BUNDLE}"
 
-      # 4) Publish artifacts
+      # ======== 4) Publish artifacts ========
       - name: Upload artifacts (bundle + reports)
         uses: actions/upload-artifact@v4
         with:
@@ -143,7 +174,7 @@ jobs:
             artifacts/hcbc_features.json
           retention-days: 30
 
-      # 5) Configure AWS (OIDC) and upload to S3
+      # ======== 5) Configure AWS (OIDC) and upload model to S3 ========
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
