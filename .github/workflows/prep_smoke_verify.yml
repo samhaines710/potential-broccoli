@@ -1,0 +1,141 @@
+name: Prep Smoke Verify (Polygon required, CI env)
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_minutes:
+        description: 'Max minutes to allow prepare_training_data.py to run'
+        required: false
+        default: '8'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+  # CI environment-scoped secrets (you’re using Environment=CI)
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+
+jobs:
+  prep-smoke:
+    runs-on: ubuntu-latest
+    environment: CI
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install minimal deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir -r "Grond-main 2/requirements.txt"
+          pip install "pandas" "numpy"
+
+      # 0) Fail immediately if Polygon key missing
+      - name: Assert POLYGON_API_KEY is present
+        run: |
+          set -euo pipefail
+          if [ -z "${POLYGON_API_KEY:-}" ]; then
+            echo "::error::POLYGON_API_KEY is not set in the CI environment."
+            exit 1
+          fi
+          echo "POLYGON_API_KEY detected (hidden)."
+
+      # 1) Preflight: verify the key & endpoint with a tiny request
+      - name: Polygon preflight (TSLA, last hour)
+        run: |
+          set -euo pipefail
+          END=$(date -u +%Y-%m-%d)
+          URL="https://api.polygon.io/v2/aggs/ticker/TSLA/range/5/minute/$END/$END?adjusted=true&sort=asc&limit=5&apiKey=${POLYGON_API_KEY}"
+          echo "GET $URL"
+          http_code=$(curl -s -o /tmp/presp.json -w "%{http_code}" "$URL" || true)
+          echo "HTTP $http_code"
+          if [ "$http_code" != "200" ]; then
+            echo "::error::Polygon preflight failed (HTTP $http_code). Check key/permissions."
+            test -s /tmp/presp.json && head -c 400 /tmp/presp.json || true
+            exit 1
+          fi
+          head -c 400 /tmp/presp.json || true
+
+      # 2) Run your prep with a hard timeout (Linux 'timeout')
+      - name: Run prepare_training_data.py (time-boxed)
+        env:
+          POLYGON_API_KEY: ${{ env.POLYGON_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "Grond-main 2/data" "Grond-main 2/Resources"
+          export POLYGON_API_KEY
+          echo "Starting prep (timeout: ${{ github.event.inputs.timeout_minutes }} min)"
+          timeout "${{ github.event.inputs.timeout_minutes }}m" \
+            python "Grond-main 2/prepare_training_data.py" || {
+              status=$?
+              if [ $status -eq 124 ]; then
+                echo "::warning::Prep timed out at ${{ github.event.inputs.timeout_minutes }} minutes (this is expected for smoke)."
+              else
+                echo "::error::Prep exited with status $status"
+                exit $status
+              fi
+            }
+
+      # 3) Auto-discover the newest CSV your prep created (don’t assume name)
+      - name: Discover prepared CSV
+        id: discover_csv
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import os, glob
+          root = "Grond-main 2"
+          pats = [
+            "*movement*training*data*.csv", "*movement*training*.csv",
+            "*training*data*.csv", "*prepared*.csv", "*training*.csv", "*.csv"
+          ]
+          cand = []
+          for p in pats:
+            cand.extend(glob.glob(os.path.join(root, "data", p)))
+            if cand: break
+          if not cand:
+            # broaden search if subpath differs
+            for p in pats:
+              cand.extend(glob.glob(os.path.join(root, "**", p), recursive=True))
+              if cand: break
+          if not cand:
+            raise SystemExit("::error::No CSVs produced by prep yet.")
+          newest = max(cand, key=lambda x: os.path.getmtime(x))
+          print("Newest CSV:", newest)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+            f.write(f"RAW_PREP_OUT={newest}\n")
+          PY
+
+      # 4) Verify + show header quickly so you see schema immediately
+      - name: Verify + show dataset head
+        run: |
+          set -euo pipefail
+          echo "RAW_PREP_OUT=${RAW_PREP_OUT}"
+          test -s "${RAW_PREP_OUT}"
+          python - << 'PY'
+          import pandas as pd, os
+          p=os.environ["RAW_PREP_OUT"]; df=pd.read_csv(p, nrows=200)
+          print("Prepared rows (file size may be larger):", len(df))
+          print("Columns (first 60):", df.columns.tolist()[:60])
+          print(df.head(10).to_string())
+          PY
+
+      # 5) Upload the discovered CSV so you can inspect it from the run page
+      - name: Upload prepared CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared_dataset_snapshot
+          path: "${{ env.RAW_PREP_OUT }}"
+          retention-days: 3
