@@ -1,172 +1,241 @@
-name: train-and-publish
+name: Train & Publish HCBC Model (Polygon required, CI env, robust data discovery)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+    inputs:
+      n_trials:
+        description: 'Optuna trials'
+        required: false
+        default: '40'
+      folds:
+        description: 'Walk-forward folds'
+        required: false
+        default: '6'
+      embargo_rows:
+        description: 'Embargo rows between train/val'
+        required: false
+        default: '200'
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 env:
-  PYTHON_VERSION: "3.11"
-  ML_MODEL_PATH: "Resources/xgb_hcbc.bundle.joblib"
-  DATA_DIR: "data"
-  MODELS_DIR: "models"
-  LOGS_DIR: "logs"
-  HCBC_H_KEY: "H"
-  HCBC_DEFAULT_H: "15"
+  PYTHONUNBUFFERED: "1"
+
+  ARTIFACT_DIR: artifacts
+  HCBC_OUT: artifacts/multiH_binary.csv
+  MODEL_BUNDLE: artifacts/xgb_hcbc.bundle.joblib
+
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ML_MODEL_PATH: ${{ secrets.ML_MODEL_PATH }}
+  POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
 
 jobs:
   train-and-publish:
     runs-on: ubuntu-latest
-
-    # Make secrets available as plain env so we can use env.* in `if:` guards
-    env:
-      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      S3_BUCKET: ${{ secrets.S3_BUCKET }}
-
-    defaults:
-      run:
-        working-directory: "Grond-main 2"
-        shell: bash
+    environment: CI
+    timeout-minutes: 720
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.11'
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ env.PYTHON_VERSION }}-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-${{ env.PYTHON_VERSION }}-
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
 
       - name: Install dependencies
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --no-cache-dir -r "Grond-main 2/requirements.txt"
+          pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" \
+                      "fastapi" "pydantic" "uvicorn[standard]" "pandas" "numpy" \
+                      "pyarrow" "fastparquet"
 
-      # ────────────────────────── DATA PREP ──────────────────────────
+      - name: Assert POLYGON_API_KEY is present
+        run: |
+          set -euo pipefail
+          if [ -z "${POLYGON_API_KEY:-}" ]; then
+            echo "::error::POLYGON_API_KEY is not set in the CI environment."
+            exit 1
+          fi
+          echo "POLYGON_API_KEY detected (hidden)."
+
+      - name: Prepare directories
+        run: |
+          set -euo pipefail
+          mkdir -p "Grond-main 2/data" "Grond-main 2/Resources" "${ARTIFACT_DIR}"
+
+      # 1) PREP (logs captured)
       - name: Run prepare_training_data.py (Polygon)
         env:
-          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
-          DATA_DIR: ${{ env.DATA_DIR }}
+          POLYGON_API_KEY: ${{ env.POLYGON_API_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p "${DATA_DIR}"
-          python prepare_training_data.py
-          echo "✅ prepare_training_data.py completed."
+          export POLYGON_API_KEY
+          python "Grond-main 2/prepare_training_data.py" 2>&1 | tee "${ARTIFACT_DIR}/prep.log"
+          test ${PIPESTATUS[0]} -eq 0
 
-      - name: Discover dataset under data and verify CSV exists
+      # 2) DISCOVER & NORMALIZE DATA
+      - name: Discover dataset under Grond-main 2/data and normalize to CSV
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          files=("${DATA_DIR}"/*.csv)
-          if (( ${#files[@]} == 0 )); then
-            echo "::error::No CSV found in '${DATA_DIR}'. PWD=$(pwd)"
-            ls -la
-            exit 1
-          fi
-          echo "Found CSV(s): ${files[*]}"
-          csv="${DATA_DIR}/movement_training_data.csv"
-          if [[ ! -f "$csv" ]]; then
-            echo "::error::Expected CSV at '$csv' but not found"
-            exit 1
-          fi
-          rows=$(( $(wc -l < "$csv") - 1 ))
-          cols=$(head -n1 "$csv" | awk -F',' '{print NF}')
-          sha=$(sha256sum "$csv" | awk '{print $1}')
-          echo "MANIFEST path=$csv rows=$rows cols=$cols sha256=${sha:0:16}"
+          python - << 'PY'
+          import os, glob, sys
+          import pandas as pd
+          data_dir = os.path.join("Grond-main 2", "data")
+          if not os.path.isdir(data_dir):
+            print(f"::error::Data directory missing: {data_dir}", file=sys.stderr)
+            sys.exit(1)
+          patterns = ["*.csv", "*.parquet", "*.feather"]
+          cands = []
+          for pat in patterns:
+            cands.extend(glob.glob(os.path.join(data_dir, pat)))
+          if not cands:
+            print(f"::error::No files found in {data_dir}", file=sys.stderr)
+            sys.exit(1)
+          newest = max(cands, key=lambda p: os.path.getmtime(p))
+          root, ext = os.path.splitext(newest)
+          out_csv = os.path.join("artifacts", "prepared_dataset.csv")
+          os.makedirs("artifacts", exist_ok=True)
+          try:
+            ext = ext.lower()
+            if ext == ".csv":
+              df_head = pd.read_csv(newest, nrows=1)
+              if df_head.empty:
+                print(f"::error::CSV appears to contain only a header (no rows): {newest}", file=sys.stderr)
+                sys.exit(1)
+              import shutil; shutil.copy2(newest, out_csv)
+            elif ext == ".parquet":
+              df = pd.read_parquet(newest)
+              if df.empty:
+                print(f"::error::Parquet file is empty: {newest}", file=sys.stderr); sys.exit(1)
+              df.to_csv(out_csv, index=False)
+            elif ext == ".feather":
+              df = pd.read_feather(newest)
+              if df.empty:
+                print(f"::error::Feather file is empty: {newest}", file=sys.stderr); sys.exit(1)
+              df.to_csv(out_csv, index=False)
+            else:
+              print(f"::error::Unsupported extension {ext} for {newest}", file=sys.stderr); sys.exit(1)
+          except Exception as e:
+            print(f"::error::Failed to normalize dataset {newest} to CSV: {e}", file=sys.stderr)
+            sys.exit(1)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+            f.write(f"RAW_PREP_OUT={out_csv}\n")
+          df = pd.read_csv(out_csv, nrows=200)
+          print("Discovered source:", newest)
+          print("Normalized CSV:", out_csv)
+          print("Columns:", df.columns.tolist())
+          print(df.head(5).to_string())
+          PY
 
-      # ────────────────────────── HCBC DATASET ──────────────────────────
+      # 3) ENSURE HCBC SCHEMA (adds H + label_up)
       - name: Ensure HCBC schema (adds H + label_up)
-        env:
-          DATA_DIR: ${{ env.DATA_DIR }}
-          HCBC_H_KEY: ${{ env.HCBC_H_KEY }}
-          HCBC_DEFAULT_H: ${{ env.HCBC_DEFAULT_H }}
         run: |
           set -euo pipefail
-          mkdir -p "${DATA_DIR}"
-          python audit_fixes/prepare_hcbc_dataset.py \
-            --input "${DATA_DIR}/movement_training_data.csv" \
-            --output "${DATA_DIR}/hcbc_training.csv" \
-            --h-key "${HCBC_H_KEY}" \
-            --default-h "${HCBC_DEFAULT_H}" \
-            --drop-neutral
+          SRC="artifacts/prepared_dataset.csv"   # produced by previous step
+          if [ ! -s "${SRC}" ]; then
+            echo "::error::Normalized CSV missing: ${SRC}"
+            exit 1
+          fi
+          # Probe whether SRC already has H & label_up; return code drives the branch.
+          if python - << 'PY'
+          import pandas as pd
+          df = pd.read_csv("artifacts/prepared_dataset.csv", nrows=1)
+          cols = set(map(str.lower, df.columns))
+          # exit code 0 => needs conversion; 1 => already HCBC
+          import sys; sys.exit(0 if not {"h","label_up"} <= cols else 1)
+          PY
+          then
+            echo "Converting to HCBC via prepare_hcbc_dataset.py"
+            python "Grond-main 2/prepare_hcbc_dataset.py" \
+              --in "${SRC}" \
+              --out "${HCBC_OUT}" \
+              --h 2 \
+              --drop-neutral
+          else
+            echo "Source already has H & label_up; copying"
+            cp "${SRC}" "${HCBC_OUT}"
+          fi
+          test -s "${HCBC_OUT}"
 
       - name: Show HCBC head (sanity)
-        env:
-          DATA_DIR: ${{ env.DATA_DIR }}
-          HCBC_H_KEY: ${{ env.HCBC_H_KEY }}
         run: |
           set -euo pipefail
-          python -c "import os,pandas as pd; d=os.environ.get('DATA_DIR','data'); h=os.environ.get('HCBC_H_KEY','H'); df=pd.read_csv(f'{d}/hcbc_training.csv'); print(df.head(10).to_string()); print('\nColumns:', list(df.columns)); assert 'label_up' in df.columns, 'HCBC dataset missing label_up'; assert h in df.columns, f'HCBC dataset missing horizon key {h}'"
+          python - << 'PY'
+          import pandas as pd
+          df=pd.read_csv("artifacts/multiH_binary.csv", nrows=200)
+          print("HCBC columns:", df.columns.tolist())
+          print(df.head(5).to_string())
+          PY
 
-      # ────────────────────────── HCBC TRAIN (XGB + Optuna) ──────────────────────────
+      # 4) TRAIN (logs captured)
       - name: Train HCBC (XGBoost + Optuna)
-        env:
-          DATA_DIR: ${{ env.DATA_DIR }}
-          MODELS_DIR: ${{ env.MODELS_DIR }}
-          LOGS_DIR: ${{ env.LOGS_DIR }}
-          HCBC_H_KEY: ${{ env.HCBC_H_KEY }}
-          N_TRIALS: "40"
-          RANDOM_STATE: "42"
         run: |
           set -euo pipefail
-          mkdir -p "${MODELS_DIR}" "${LOGS_DIR}" Resources
-          python audit_fixes/train_hcbc_xgb_optuna.py \
-            --train-csv "${DATA_DIR}/hcbc_training.csv" \
-            --h-key "${HCBC_H_KEY}" \
-            --out-bundle "${{ env.ML_MODEL_PATH }}" \
-            --out-report "${LOGS_DIR}/hcbc_report.json" \
-            --n-trials "${N_TRIALS}" \
-            --random-state "${RANDOM_STATE}"
-          echo "✅ HCBC bundle created at ${{ env.ML_MODEL_PATH }}"
+          python "audit_fixes/train_hcbc_xgb_optuna.py" \
+            --data "${HCBC_OUT}" \
+            --out "${MODEL_BUNDLE}" \
+            --n-trials "${{ github.event.inputs.n_trials || 40 }}" \
+            --folds "${{ github.event.inputs.folds || 6 }}" \
+            --embargo-rows "${{ github.event.inputs.embargo_rows || 200 }}" \
+            --seed 42 2>&1 | tee "${ARTIFACT_DIR}/train.log"
+          test ${PIPESTATUS[0]} -eq 0
+          test -s "${MODEL_BUNDLE}"
 
-      # ────────────────────────── ARTIFACTS ──────────────────────────
+      # 5) UPLOAD ARTIFACTS
       - name: Upload artifacts (bundle + reports + logs)
         uses: actions/upload-artifact@v4
         with:
-          name: hcbc-model-and-logs
+          name: hcbc_model_bundle_and_logs
           path: |
-            Grond-main 2/${{ env.ML_MODEL_PATH }}
-            Grond-main 2/${{ env.LOGS_DIR }}/
-            Grond-main 2/${{ env.MODELS_DIR }}/
-          if-no-files-found: error
-          retention-days: 7
+            artifacts/xgb_hcbc.bundle.joblib
+            artifacts/hcbc_cv_report.json
+            artifacts/hcbc_thresholds.json
+            artifacts/hcbc_features.json
+            artifacts/prep.log
+            artifacts/train.log
+            artifacts/prepared_dataset.csv
+          retention-days: 30
 
-      # ────────────────────────── AWS PUBLISH (OIDC) ──────────────────────────
+      # 6) AWS: OIDC + S3 publish
       - name: Configure AWS (OIDC)
-        if: ${{ env.AWS_ROLE_ARN != '' && env.AWS_REGION != '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::719070647059:role/tigermoon
+          aws-region: ${{ env.AWS_REGION || 'us-east-1' }}
 
       - name: Upload model bundle to S3 (ML_MODEL_PATH)
-        if: ${{ env.S3_BUCKET != '' && env.AWS_ROLE_ARN != '' && env.AWS_REGION != '' }}
+        if: ${{ env.ML_MODEL_PATH }}
         run: |
           set -euo pipefail
-          MODEL="${{ env.ML_MODEL_PATH }}"
-          DEST="s3://${{ env.S3_BUCKET }}/models/hcbc/$(date +%Y%m%d-%H%M%S)-bundle.joblib"
-          aws s3 cp "${MODEL}" "${DEST}"
-          echo "s3_uri=${DEST}" >> $GITHUB_OUTPUT
+          echo "Uploading model to ${ML_MODEL_PATH}"
+          aws s3 cp "${MODEL_BUNDLE}" "${ML_MODEL_PATH}" --only-show-errors
 
       - name: Upload logs to S3 (co-located with model)
-        if: ${{ env.S3_BUCKET != '' && env.AWS_ROLE_ARN != '' && env.AWS_REGION != '' }}
+        if: ${{ env.ML_MODEL_PATH }}
         run: |
           set -euo pipefail
-          PREFIX="s3://${{ env.S3_BUCKET }}/models/hcbc/logs/$(date +%Y%m%d-%H%M%S)/"
-          aws s3 cp "${LOGS_DIR}" "${PREFIX}" --recursive
-          echo "logs_prefix=${PREFIX}" >> $GITHUB_OUTPUT
+          TS=$(date -u +"%Y%m%dT%H%M%SZ")
+          BUCKET="$(echo "${ML_MODEL_PATH}" | sed 's@^s3://@@' | cut -d/ -f1)"
+          KEY="$(echo "${ML_MODEL_PATH}" | sed 's@^s3://@@' | cut -d/ -f2-)"
+          BASE_DIR="$(dirname "${KEY}")"
+          PREFIX="s3://${BUCKET}/${BASE_DIR}/logs/${TS}"
+          echo "Uploading logs to ${PREFIX}"
+          aws s3 cp "artifacts/prep.log"  "${PREFIX}/prep.log"  --only-show-errors || true
+          aws s3 cp "artifacts/train.log" "${PREFIX}/train.log" --only-show-errors || true
+          if [ -f "artifacts/prepared_dataset.csv" ]; then
+            aws s3 cp "artifacts/prepared_dataset.csv" "${PREFIX}/prepared_dataset_snapshot.csv" --only-show-errors || true
+          fi
