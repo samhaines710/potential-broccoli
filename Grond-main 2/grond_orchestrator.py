@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Central orchestrator for the Grond trading system.
 
@@ -16,7 +17,7 @@ import fcntl
 import logging
 import time
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union
 
 import numpy as np
 from prometheus_client import Counter
@@ -37,7 +38,8 @@ from data_ingestion import (
     REALTIME_LOCK,
 )
 from pricing_engines import DerivativesPricer
-from ml_classifier import MLClassifier
+# === FIX: use HCBCClassifier (calibrated XGBoost bundle) instead of MLClassifier ===
+from ml_classifier import HCBCClassifier
 from strategy_logic import StrategyLogic
 from signal_generation import BanditAllocator
 from execution_layer import ManualExecutor
@@ -82,6 +84,11 @@ _ALLOW_NEUTRAL_BANDIT = os.getenv("ALLOW_NEUTRAL_BANDIT", "0").lower() in {"1", 
 _LOCK_FILE = os.getenv("GROND_LOCK_FILE", "/tmp/grond_orchestrator.lock")
 _INSTANCE_ID = os.getenv("INSTANCE_ID", f"pid-{os.getpid()}")
 
+# ─── HCBC bundle/config (H key/value) ─────────────────────────────────────────
+_MODEL_PATH = os.getenv("ML_MODEL_PATH", "Resources/xgb_hcbc.bundle.joblib")
+_H_KEY = os.getenv("HCBC_H_KEY", "H")
+_H_DEFAULT = int(os.getenv("HCBC_DEFAULT_H", "15"))  # horizon in minutes
+
 
 class GrondOrchestrator:
     def __init__(self) -> None:
@@ -108,7 +115,8 @@ class GrondOrchestrator:
         self.rt_stream.start()
 
         self.pricer = DerivativesPricer()
-        self.classifier = MLClassifier()
+        # === FIX: instantiate HCBCClassifier with bundle path ===
+        self.classifier = HCBCClassifier(_MODEL_PATH)
         self.logic = StrategyLogic()
         self.bandit = BanditAllocator(
             list(self.logic.logic_branches.keys()),
@@ -118,7 +126,7 @@ class GrondOrchestrator:
 
         write_status(
             f"[{_INSTANCE_ID}] Orchestrator ready (epsilon={_EPSILON}, "
-            f"allow_neutral_bandit={_ALLOW_NEUTRAL_BANDIT})"
+            f"allow_neutral_bandit={_ALLOW_NEUTRAL_BANDIT}, model='{_MODEL_PATH}', H={_H_DEFAULT})"
         )
 
     def _decide_movement(self, base_mv: str) -> Tuple[str, bool]:
@@ -176,7 +184,7 @@ class GrondOrchestrator:
                 # include 'source' from Greeks for ML pipeline
                 source_val = str(greeks.get("source", "fallback"))
 
-                features: Dict[str, float | str] = {
+                features: Dict[str, Union[float, str, int]] = {
                     "breakout_prob":      breakout,
                     "recent_move_pct":    recent_pct,
                     "volume_ratio":       vol_ratio,
@@ -203,6 +211,8 @@ class GrondOrchestrator:
                     "theta_day": theta_day,
                     "theta_5m":  theta_5m,
                     "source": source_val,
+                    # === FIX: inject HCBC horizon feature ===
+                    _H_KEY: _H_DEFAULT,
                 }
 
                 cls_out = self.classifier.classify(features)
