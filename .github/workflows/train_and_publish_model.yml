@@ -68,30 +68,20 @@ jobs:
           shopt -s nullglob
           files=("${DATA_DIR}"/*.csv)
           if (( ${#files[@]} == 0 )); then
-            echo "::error::No CSV found in '${DATA_DIR}'. PWD=$(pwd)"; ls -la
+            echo "::error::No CSV found in '${DATA_DIR}'. PWD=$(pwd)"
+            ls -la
             exit 1
           fi
           echo "Found CSV(s): ${files[*]}"
-          # Quick manifest (YAML-safe heredoc; read env vars inside Python)
-          python - <<'PY'
-import os, json, hashlib
-from pathlib import Path
-import pandas as pd
-
-data_dir = Path(os.environ.get("DATA_DIR", "data"))
-p = data_dir / "movement_training_data.csv"
-if not p.exists():
-    raise SystemExit(f"::error::Expected CSV at {p} but not found")
-df = pd.read_csv(p)
-h = hashlib.sha256(p.read_bytes()).hexdigest()
-manifest = {
-  "path": str(p),
-  "rows": int(df.shape[0]),
-  "cols": list(df.columns),
-  "sha256": h[:16]
-}
-print(json.dumps(manifest, indent=2))
-PY
+          csv="${DATA_DIR}/movement_training_data.csv"
+          if [[ ! -f "$csv" ]]; then
+            echo "::error::Expected CSV at '$csv' but not found"
+            exit 1
+          fi
+          rows=$(( $(wc -l < "$csv") - 1 ))
+          cols=$(head -n1 "$csv" | awk -F',' '{print NF}')
+          sha=$(sha256sum "$csv" | awk '{print $1}')
+          echo "MANIFEST path=$csv rows=$rows cols=$cols sha256=${sha:0:16}"
 
       # ────────────────────────── HCBC DATASET ──────────────────────────
       - name: Ensure HCBC schema (adds H + label_up)
@@ -109,18 +99,13 @@ PY
             --default-h "${HCBC_DEFAULT_H}" \
             --drop-neutral
 
-      - name: Show HCBC head
+      - name: Show HCBC head (sanity)
+        env:
+          DATA_DIR: ${{ env.DATA_DIR }}
+          HCBC_H_KEY: ${{ env.HCBC_H_KEY }}
         run: |
-          python - <<'PY'
-import os, pandas as pd
-data_dir = os.environ.get("DATA_DIR", "data")
-hkey = os.environ.get("HCBC_H_KEY", "H")
-df = pd.read_csv(f"{data_dir}/hcbc_training.csv")
-print(df.head(10).to_string())
-print("\nColumns:", list(df.columns))
-assert "label_up" in df.columns, "HCBC dataset missing label_up"
-assert hkey in df.columns, f"HCBC dataset missing horizon key {hkey}"
-PY
+          set -euo pipefail
+          python -c "import os,pandas as pd; d=os.environ.get('DATA_DIR','data'); h=os.environ.get('HCBC_H_KEY','H'); df=pd.read_csv(f'{d}/hcbc_training.csv'); print(df.head(10).to_string()); print('\nColumns:', list(df.columns)); assert 'label_up' in df.columns, 'HCBC dataset missing label_up'; assert h in df.columns, f'HCBC dataset missing horizon key {h}'"
 
       # ────────────────────────── HCBC TRAIN (XGB + Optuna) ──────────────────────────
       - name: Train HCBC (XGBoost + Optuna)
