@@ -72,7 +72,7 @@ jobs:
             exit 1
           fi
           echo "Found CSV(s): ${files[*]}"
-          # Show quick manifest (FIX: matching heredoc token + read env in Python)
+          # Quick manifest (YAML-safe heredoc; read env vars inside Python)
           python - <<'PY'
 import os, json, hashlib
 from pathlib import Path
