@@ -8,17 +8,14 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # for AWS OIDC
+  id-token: write
 
 env:
   PYTHON_VERSION: "3.11"
-  # HCBC bundle default path (used by orchestrator/serve); keep consistent
   ML_MODEL_PATH: "Resources/xgb_hcbc.bundle.joblib"
-  # Local output directories (relative to working-directory below)
   DATA_DIR: "data"
   MODELS_DIR: "models"
   LOGS_DIR: "logs"
-  # HCBC defaults
   HCBC_H_KEY: "H"
   HCBC_DEFAULT_H: "15"
 
@@ -26,7 +23,6 @@ jobs:
   train-and-publish:
     runs-on: ubuntu-latest
 
-    # >>> KEY FIX: normalize all 'run' steps to the repo subfolder with a space <<<
     defaults:
       run:
         working-directory: "Grond-main 2"
@@ -51,6 +47,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
@@ -75,11 +72,16 @@ jobs:
             exit 1
           fi
           echo "Found CSV(s): ${files[*]}"
-          # Show quick manifest
+          # Show quick manifest (FIX: matching heredoc token + read env in Python)
           python - <<'PY'
+import os, json, hashlib
 from pathlib import Path
-import pandas as pd, json, hashlib
-p = Path("${DATA_DIR}") / "movement_training_data.csv"
+import pandas as pd
+
+data_dir = Path(os.environ.get("DATA_DIR", "data"))
+p = data_dir / "movement_training_data.csv"
+if not p.exists():
+    raise SystemExit(f"::error::Expected CSV at {p} but not found")
 df = pd.read_csv(p)
 h = hashlib.sha256(p.read_bytes()).hexdigest()
 manifest = {
@@ -110,12 +112,14 @@ PY
       - name: Show HCBC head
         run: |
           python - <<'PY'
-import pandas as pd
-df = pd.read_csv("${DATA_DIR}/hcbc_training.csv")
+import os, pandas as pd
+data_dir = os.environ.get("DATA_DIR", "data")
+hkey = os.environ.get("HCBC_H_KEY", "H")
+df = pd.read_csv(f"{data_dir}/hcbc_training.csv")
 print(df.head(10).to_string())
 print("\nColumns:", list(df.columns))
 assert "label_up" in df.columns, "HCBC dataset missing label_up"
-assert "${HCBC_H_KEY}" in df.columns, f"HCBC dataset missing horizon key ${HCBC_H_KEY}"
+assert hkey in df.columns, f"HCBC dataset missing horizon key {hkey}"
 PY
 
       # ────────────────────────── HCBC TRAIN (XGB + Optuna) ──────────────────────────
@@ -125,7 +129,6 @@ PY
           MODELS_DIR: ${{ env.MODELS_DIR }}
           LOGS_DIR: ${{ env.LOGS_DIR }}
           HCBC_H_KEY: ${{ env.HCBC_H_KEY }}
-          # You can tune trials via env; keep modest for CI
           N_TRIALS: "40"
           RANDOM_STATE: "42"
         run: |
