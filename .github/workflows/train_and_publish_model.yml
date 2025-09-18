@@ -1,4 +1,4 @@
-name: Train & Publish HCBC Model (Polygon required, CI env, colocated logs)
+name: Train & Publish HCBC Model (Polygon required, CI env, robust data discovery)
 
 on:
   workflow_dispatch:
@@ -27,6 +27,7 @@ env:
   HCBC_OUT: artifacts/multiH_binary.csv
   MODEL_BUNDLE: artifacts/xgb_hcbc.bundle.joblib
 
+  # CI environment secrets (job is scoped to environment: CI)
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ML_MODEL_PATH: ${{ secrets.ML_MODEL_PATH }}
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
@@ -60,7 +61,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r "Grond-main 2/requirements.txt"
           pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" \
-                      "fastapi" "pydantic" "uvicorn[standard]" "pandas" "numpy"
+                      "fastapi" "pydantic" "uvicorn[standard]" "pandas" "numpy" \
+                      "pyarrow" "fastparquet"
 
       - name: Assert POLYGON_API_KEY is present
         run: |
@@ -86,33 +88,88 @@ jobs:
           python "Grond-main 2/prepare_training_data.py" 2>&1 | tee "${ARTIFACT_DIR}/prep.log"
           test ${PIPESTATUS[0]} -eq 0
 
-      # ===================== 2) VERIFY PREPARED DATA =====================
-      - name: Verify prepared dataset
+      # ===================== 2) DISCOVER & NORMALIZE DATA =================
+      - name: Discover dataset under Grond-main 2/data and normalize to CSV
         run: |
           set -euo pipefail
-          CSV="Grond-main 2/data/movement_training_data.csv"
-          if [ ! -s "$CSV" ]; then
-            echo "::error::Expected training data at $CSV but file not found or empty."
-            exit 1
-          fi
-          echo "RAW_PREP_OUT=$CSV" >> $GITHUB_ENV
           python - << 'PY'
-          import pandas as pd, os
-          p=os.environ["RAW_PREP_OUT"]
-          df=pd.read_csv(p, nrows=200)
-          print("Rows(sample):", len(df))
+          import os, glob, sys, pandas as pd
+          data_dir = os.path.join("Grond-main 2","data")
+          if not os.path.isdir(data_dir):
+            print("::error::Data directory missing:", data_dir, file=sys.stderr)
+            sys.exit(1)
+
+          # Prefer CSV; if none, accept parquet/feather and convert to CSV.
+          patterns = [
+              "*.csv",
+              "*.parquet",
+              "*.feather",
+          ]
+          cands = []
+          for pat in patterns:
+              cands.extend(glob.glob(os.path.join(data_dir, pat)))
+          if not cands:
+            print("::error::No files found in", data_dir, file=sys.stderr)
+            sys.exit(1)
+
+          # newest by mtime
+          newest = max(cands, key=lambda p: os.path.getmtime(p))
+          root, ext = os.path.splitext(newest)
+          out_csv = os.path.join("artifacts", "prepared_dataset.csv")
+          os.makedirs("artifacts", exist_ok=True)
+
+          try:
+              if ext.lower() == ".csv":
+                  # Validate non-empty
+                  import csv
+                  with open(newest, "r", newline="") as f:
+                      # check at least one non-header row
+                      has_row = any(i>0 for i,_ in enumerate(f))
+                  if not has_row:
+                      print(f"::error::CSV {newest} appears empty.", file=sys.stderr)
+                      sys.exit(1)
+                  # Copy to canonical artifacts path
+                  import shutil
+                  shutil.copy2(newest, out_csv)
+              elif ext.lower() == ".parquet":
+                  df = pd.read_parquet(newest)
+                  if df.empty:
+                      print(f"::error::Parquet {newest} empty.", file=sys.stderr)
+                      sys.exit(1)
+                  df.to_csv(out_csv, index=False)
+              elif ext.lower() == ".feather":
+                  df = pd.read_feather(newest)
+                  if df.empty:
+                      print(f"::error::Feather {newest} empty.", file=sys.stderr)
+                      sys.exit(1)
+                  df.to_csv(out_csv, index=False)
+              else:
+                  print(f"::error::Unsupported extension {ext} for {newest}", file=sys.stderr)
+                  sys.exit(1)
+          except Exception as e:
+              print(f\"\"\"::error::Failed to normalize dataset {newest} → CSV: {e}\"\"\", file=sys.stderr)
+              sys.exit(1)
+
+          # Export normalized CSV path
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"RAW_PREP_OUT={out_csv}\n")
+
+          # Print a small preview
+          df = pd.read_csv(out_csv, nrows=200)
+          print("Discovered:", newest)
+          print("Normalized CSV:", out_csv)
           print("Columns:", df.columns.tolist())
-          print(df.head(5).to_string())
+          print("Head:\n", df.head(5).to_string())
           PY
 
-      # ===================== 3) CONVERT (only if needed) =================
+      # ===================== 3) ENSURE HCBC SCHEMA =======================
       - name: Ensure HCBC schema (H + label_up)
         run: |
           set -euo pipefail
           if python - << 'PY'
           import pandas as pd, os
           df = pd.read_csv(os.environ["RAW_PREP_OUT"], nrows=1)
-          cols = set(df.columns.str.lower())
+          cols = set(map(str.lower, df.columns))
           print(not ({"h","label_up"} <= cols))
           PY
           then
@@ -134,7 +191,6 @@ jobs:
           python - << 'PY'
           import pandas as pd, os
           p=os.environ["HCBC_OUT"]; df=pd.read_csv(p, nrows=200)
-          print("HCBC rows(sample):", len(df))
           print("HCBC columns:", df.columns.tolist())
           print(df.head(5).to_string())
           PY
@@ -165,6 +221,7 @@ jobs:
             artifacts/hcbc_features.json
             artifacts/prep.log
             artifacts/train.log
+            artifacts/prepared_dataset.csv
           retention-days: 30
 
       # ===================== 6) AWS: OIDC + S3 publish ==================
