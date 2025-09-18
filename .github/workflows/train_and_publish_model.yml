@@ -27,7 +27,7 @@ env:
   HCBC_OUT: artifacts/multiH_binary.csv
   MODEL_BUNDLE: artifacts/xgb_hcbc.bundle.joblib
 
-  # CI environment secrets (job is scoped to environment: CI)
+  # CI environment secrets (job uses environment: CI)
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ML_MODEL_PATH: ${{ secrets.ML_MODEL_PATH }}
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
@@ -93,73 +93,68 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PY'
-          import os, glob, sys, pandas as pd
-          data_dir = os.path.join("Grond-main 2","data")
+          import os, glob, sys
+          import pandas as pd
+
+          data_dir = os.path.join("Grond-main 2", "data")
           if not os.path.isdir(data_dir):
-            print("::error::Data directory missing:", data_dir, file=sys.stderr)
+            print(f"::error::Data directory missing: {data_dir}", file=sys.stderr)
             sys.exit(1)
 
-          # Prefer CSV; if none, accept parquet/feather and convert to CSV.
-          patterns = [
-              "*.csv",
-              "*.parquet",
-              "*.feather",
-          ]
+          patterns = ["*.csv", "*.parquet", "*.feather"]
           cands = []
           for pat in patterns:
-              cands.extend(glob.glob(os.path.join(data_dir, pat)))
+            cands.extend(glob.glob(os.path.join(data_dir, pat)))
+
           if not cands:
-            print("::error::No files found in", data_dir, file=sys.stderr)
+            print(f"::error::No files found in {data_dir}", file=sys.stderr)
             sys.exit(1)
 
-          # newest by mtime
           newest = max(cands, key=lambda p: os.path.getmtime(p))
           root, ext = os.path.splitext(newest)
           out_csv = os.path.join("artifacts", "prepared_dataset.csv")
           os.makedirs("artifacts", exist_ok=True)
 
           try:
-              if ext.lower() == ".csv":
-                  # Validate non-empty
-                  import csv
-                  with open(newest, "r", newline="") as f:
-                      # check at least one non-header row
-                      has_row = any(i>0 for i,_ in enumerate(f))
-                  if not has_row:
-                      print(f"::error::CSV {newest} appears empty.", file=sys.stderr)
-                      sys.exit(1)
-                  # Copy to canonical artifacts path
-                  import shutil
-                  shutil.copy2(newest, out_csv)
-              elif ext.lower() == ".parquet":
-                  df = pd.read_parquet(newest)
-                  if df.empty:
-                      print(f"::error::Parquet {newest} empty.", file=sys.stderr)
-                      sys.exit(1)
-                  df.to_csv(out_csv, index=False)
-              elif ext.lower() == ".feather":
-                  df = pd.read_feather(newest)
-                  if df.empty:
-                      print(f"::error::Feather {newest} empty.", file=sys.stderr)
-                      sys.exit(1)
-                  df.to_csv(out_csv, index=False)
-              else:
-                  print(f"::error::Unsupported extension {ext} for {newest}", file=sys.stderr)
-                  sys.exit(1)
-          except Exception as e:
-              print(f\"\"\"::error::Failed to normalize dataset {newest} → CSV: {e}\"\"\", file=sys.stderr)
+            ext = ext.lower()
+            if ext == ".csv":
+              df_head = pd.read_csv(newest, nrows=1)
+              if df_head.empty:
+                print(f"::error::CSV appears to contain only a header (no rows): {newest}", file=sys.stderr)
+                sys.exit(1)
+              import shutil
+              shutil.copy2(newest, out_csv)
+
+            elif ext == ".parquet":
+              df = pd.read_parquet(newest)
+              if df.empty:
+                print(f"::error::Parquet file is empty: {newest}", file=sys.stderr)
+                sys.exit(1)
+              df.to_csv(out_csv, index=False)
+
+            elif ext == ".feather":
+              df = pd.read_feather(newest)
+              if df.empty:
+                print(f"::error::Feather file is empty: {newest}", file=sys.stderr)
+                sys.exit(1)
+              df.to_csv(out_csv, index=False)
+
+            else:
+              print(f"::error::Unsupported extension {ext} for {newest}", file=sys.stderr)
               sys.exit(1)
 
-          # Export normalized CSV path
-          with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write(f"RAW_PREP_OUT={out_csv}\n")
+          except Exception as e:
+            print(f"::error::Failed to normalize dataset {newest} to CSV: {e}", file=sys.stderr)
+            sys.exit(1)
 
-          # Print a small preview
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+            f.write(f"RAW_PREP_OUT={out_csv}\n")
+
           df = pd.read_csv(out_csv, nrows=200)
-          print("Discovered:", newest)
+          print("Discovered source:", newest)
           print("Normalized CSV:", out_csv)
           print("Columns:", df.columns.tolist())
-          print("Head:\n", df.head(5).to_string())
+          print(df.head(5).to_string())
           PY
 
       # ===================== 3) ENSURE HCBC SCHEMA =======================
