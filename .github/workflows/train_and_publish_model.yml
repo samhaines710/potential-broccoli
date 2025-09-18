@@ -23,6 +23,12 @@ jobs:
   train-and-publish:
     runs-on: ubuntu-latest
 
+    # Make secrets available as plain env so we can use env.* in `if:` guards
+    env:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+
     defaults:
       run:
         working-directory: "Grond-main 2"
@@ -142,25 +148,25 @@ jobs:
 
       # ────────────────────────── AWS PUBLISH (OIDC) ──────────────────────────
       - name: Configure AWS (OIDC)
-        if: ${{ secrets.AWS_ROLE_ARN != '' && secrets.AWS_REGION != '' }}
+        if: ${{ env.AWS_ROLE_ARN != '' && env.AWS_REGION != '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Upload model bundle to S3 (ML_MODEL_PATH)
-        if: ${{ secrets.S3_BUCKET != '' && secrets.AWS_ROLE_ARN != '' && secrets.AWS_REGION != '' }}
+        if: ${{ env.S3_BUCKET != '' && env.AWS_ROLE_ARN != '' && env.AWS_REGION != '' }}
         run: |
           set -euo pipefail
           MODEL="${{ env.ML_MODEL_PATH }}"
-          DEST="s3://${{ secrets.S3_BUCKET }}/models/hcbc/$(date +%Y%m%d-%H%M%S)-bundle.joblib"
+          DEST="s3://${{ env.S3_BUCKET }}/models/hcbc/$(date +%Y%m%d-%H%M%S)-bundle.joblib"
           aws s3 cp "${MODEL}" "${DEST}"
           echo "s3_uri=${DEST}" >> $GITHUB_OUTPUT
 
       - name: Upload logs to S3 (co-located with model)
-        if: ${{ secrets.S3_BUCKET != '' && secrets.AWS_ROLE_ARN != '' && secrets.AWS_REGION != '' }}
+        if: ${{ env.S3_BUCKET != '' && env.AWS_ROLE_ARN != '' && env.AWS_REGION != '' }}
         run: |
           set -euo pipefail
-          PREFIX="s3://${{ secrets.S3_BUCKET }}/models/hcbc/logs/$(date +%Y%m%d-%H%M%S)/"
+          PREFIX="s3://${{ env.S3_BUCKET }}/models/hcbc/logs/$(date +%Y%m%d-%H%M%S)/"
           aws s3 cp "${LOGS_DIR}" "${PREFIX}" --recursive
           echo "logs_prefix=${PREFIX}" >> $GITHUB_OUTPUT
