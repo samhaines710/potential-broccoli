@@ -12,7 +12,7 @@ on:
         required: false
         default: '6'
       embargo_rows:
-        description: 'Embargo rows between train/val'
+        description: 'Embargo rows between train/val (not used in inline trainer)'
         required: false
         default: '200'
       horizon_h:
@@ -38,6 +38,10 @@ env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ML_MODEL_PATH: ${{ secrets.ML_MODEL_PATH }}
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+
+  # Greeks strictness
+  REQUIRE_GREEKS: "1"
+  MIN_GREEKS_COVERAGE: "0.50"  # fail if <50% rows have >=3 greeks fields present
 
 jobs:
   train-and-publish:
@@ -69,7 +73,7 @@ jobs:
           pip install --no-cache-dir -r "Grond-main 2/requirements.txt"
           pip install "xgboost>=1.7,<2.0" "scikit-learn>=1.3,<1.6" "optuna>=3.5" \
                       "fastapi" "pydantic" "uvicorn[standard]" "pandas" "numpy" \
-                      "pyarrow" "fastparquet"
+                      "pyarrow" "fastparquet" "joblib" "requests"
 
       - name: Assert POLYGON_API_KEY is present
         run: |
@@ -85,143 +89,112 @@ jobs:
           set -euo pipefail
           mkdir -p "Grond-main 2/data" "Grond-main 2/Resources" "${ARTIFACT_DIR}"
 
-      # ===================== 1) PREP (logs captured) =====================
-      - name: Run prepare_training_data.py (Polygon)
+      # ── 1) PREP (logs captured; will FAIL on poor Greeks coverage) ───────────
+      - name: Run prepare_training_data.py (Polygon; per-bar Greeks, strict)
         env:
           POLYGON_API_KEY: ${{ env.POLYGON_API_KEY }}
+          REQUIRE_GREEKS: ${{ env.REQUIRE_GREEKS }}
+          MIN_GREEKS_COVERAGE: ${{ env.MIN_GREEKS_COVERAGE }}
         run: |
           set -euo pipefail
-          export POLYGON_API_KEY
+          export POLYGON_API_KEY REQUIRE_GREEKS MIN_GREEKS_COVERAGE
           python "Grond-main 2/prepare_training_data.py" 2>&1 | tee "${ARTIFACT_DIR}/prep.log"
           test ${PIPESTATUS[0]} -eq 0
 
-      # If script wrote to ./data/, relocate it to Grond-main 2/data/ so discovery is deterministic.
       - name: Relocate prepared dataset if needed
         run: |
           set -euo pipefail
           if [ -f "data/movement_training_data.csv" ]; then
-            echo "Found ./data/movement_training_data.csv → moving into Grond-main 2/data/"
             mkdir -p "Grond-main 2/data"
             mv -f "data/movement_training_data.csv" "Grond-main 2/data/"
-          else
-            echo "No ./data/movement_training_data.csv to relocate (ok if prep wrote elsewhere)."
           fi
 
-      # ===================== 2) DISCOVER & NORMALIZE =====================
+      # ── 2) DISCOVER & NORMALIZE ──────────────────────────────────────────────
       - name: Discover dataset (data/ + Grond-main 2/data) and normalize to CSV
         run: |
           set -euo pipefail
           python - << 'PY'
           import os, glob, sys, hashlib
           import pandas as pd
-
           roots = ["Grond-main 2/data", "data"]
           patterns = ["*.csv", "*.parquet", "*.feather"]
-
           candidates = []
           for root in roots:
-            if not os.path.isdir(root):
-              continue
+            if not os.path.isdir(root): continue
             for pat in patterns:
               candidates.extend(glob.glob(os.path.join(root, pat)))
-
           if not candidates:
             print("::error::No dataset files found under 'Grond-main 2/data' or './data'.", file=sys.stderr)
             sys.exit(1)
-
           newest = max(candidates, key=lambda p: os.path.getmtime(p))
-          _, ext = os.path.splitext(newest)
-          ext = ext.lower()
-
+          _, ext = os.path.splitext(newest); ext = ext.lower()
           out_csv = os.path.join("artifacts", "prepared_dataset.csv")
           os.makedirs("artifacts", exist_ok=True)
-
           try:
             if ext == ".csv":
               df_head = pd.read_csv(newest, nrows=1)
               if df_head.empty:
-                print(f"::error::CSV appears to contain only a header (no rows): {newest}", file=sys.stderr)
-                sys.exit(1)
+                print(f"::error::CSV appears to contain only a header (no rows): {newest}", file=sys.stderr); sys.exit(1)
               import shutil; shutil.copy2(newest, out_csv)
             elif ext == ".parquet":
               df = pd.read_parquet(newest)
-              if df.empty:
-                print(f"::error::Parquet file is empty: {newest}", file=sys.stderr); sys.exit(1)
+              if df.empty: print(f"::error::Parquet is empty: {newest}", file=sys.stderr); sys.exit(1)
               df.to_csv(out_csv, index=False)
             elif ext == ".feather":
               df = pd.read_feather(newest)
-              if df.empty:
-                print(f"::error::Feather file is empty: {newest}", file=sys.stderr); sys.exit(1)
+              if df.empty: print(f"::error::Feather is empty: {newest}", file=sys.stderr); sys.exit(1)
               df.to_csv(out_csv, index=False)
             else:
               print(f"::error::Unsupported extension {ext} for {newest}", file=sys.stderr); sys.exit(1)
           except Exception as e:
-            print(f"::error::Failed to normalize dataset {newest} to CSV: {e}", file=sys.stderr)
-            sys.exit(1)
-
-          # manifest + hand-off
+            print(f"::error::Failed to normalize dataset {newest} to CSV: {e}", file=sys.stderr); sys.exit(1)
           with open(out_csv, "rb") as fh:
             sha = hashlib.sha256(fh.read()).hexdigest()[:20]
           df = pd.read_csv(out_csv, nrows=200)
           print(f"MANIFEST src={newest} rows≈{sum(1 for _ in open(out_csv))-1} cols={len(df.columns)} sha256={sha}")
           print("Columns:", df.columns.tolist())
           print(df.head(5).to_string())
-
           with open(os.environ["GITHUB_ENV"], "a") as f:
             f.write(f"RAW_PREP_OUT={out_csv}\n")
           PY
 
-      # ===================== 3) ENSURE HCBC SCHEMA (INLINE) ==============
+      - name: Quick Greeks coverage view (sanity)
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import pandas as pd
+          df = pd.read_csv("artifacts/prepared_dataset.csv")
+          g = ["delta","gamma","theta","vega","rho","implied_volatility"]
+          present = df[g].notna().sum(axis=1)
+          cov = (present >= 3).mean()
+          print(f"Greeks rows with ≥3 fields present: {cov:.1%}")
+          print("Per-column non-null ratio:")
+          print((1 - df[g].isna().mean()).to_string())
+          PY
+
+      # ── 3) HCBC conversion (inline) ──────────────────────────────────────────
       - name: Ensure HCBC schema (adds H + label_up inline)
         run: |
           set -euo pipefail
           SRC="${RAW_PREP_OUT:-artifacts/prepared_dataset.csv}"
           H="${{ github.event.inputs.horizon_h }}"
           DROP_NEUTRAL="${{ github.event.inputs.drop_neutral }}"
-
-          if [ ! -s "${SRC}" ]; then
-            echo "::error::Normalized CSV missing: ${SRC}"
-            exit 1
-          fi
-
           python - << 'PY'
           import os, sys, pandas as pd
-          src = os.environ.get("SRC")
-          out = os.environ.get("HCBC_OUT")
+          src = os.environ.get("SRC", "artifacts/prepared_dataset.csv")
+          out = os.environ.get("HCBC_OUT", "artifacts/multiH_binary.csv")
           H = int(os.environ.get("H","2"))
           drop_neutral = os.environ.get("DROP_NEUTRAL","true").lower() == "true"
-
           df = pd.read_csv(src)
-          cols_lower = {c.lower() for c in df.columns}
-
-          # If already has both, just ensure types and write out
-          if {"h","label_up"} <= cols_lower:
-              # Normalize column names case-wise
-              rename = {c:c.lower() for c in df.columns}
-              df.rename(columns=rename, inplace=True)
-              if drop_neutral and "movement_type" in df.columns:
-                  df = df[df["movement_type"].str.upper() != "NEUTRAL"]
-              df.to_csv(out, index=False)
-              print(f"HCBC: passthrough existing schema → {out} rows={len(df)} cols={len(df.columns)}")
-              sys.exit(0)
-
-          # Build label_up from movement_type
           if "movement_type" not in df.columns:
-              print("::error::No 'movement_type' column to derive label_up from.", file=sys.stderr)
-              sys.exit(2)
-
+              print("::error::No 'movement_type' column to derive label_up from.", file=sys.stderr); sys.exit(2)
           mt = df["movement_type"].astype(str).str.upper()
-          label_up = (mt == "CALL").astype(int)
+          y = (mt == "CALL").astype(int)
           if drop_neutral:
-              mask = mt.isin(["CALL","PUT"])
-              df = df.loc[mask].copy()
-              label_up = label_up.loc[mask]
-
-          df["label_up"] = label_up
-          df["H"] = H
-
+              mask = mt.isin(["CALL","PUT"]); df = df.loc[mask].copy(); y = y.loc[mask]
+          df["label_up"] = y; df["H"] = H
           df.to_csv(out, index=False)
-          print(f"HCBC: created label_up (CALL=1, PUT=0, drop_neutral={drop_neutral}) and H={H} → {out} rows={len(df)} cols={len(df.columns)}")
+          print(f"HCBC ready → {out} rows={len(df)} cols={len(df.columns)}")
           PY
         env:
           SRC: ${{ env.RAW_PREP_OUT }}
@@ -237,21 +210,134 @@ jobs:
           print(df.head(5).to_string())
           PY
 
-      # ===================== 4) TRAIN (logs captured) ====================
+      # ── 4) TRAIN (inline: XGBoost + Optuna) ─────────────────────────────────
       - name: Train HCBC (XGBoost + Optuna)
         run: |
           set -euo pipefail
-          python "audit_fixes/train_hcbc_xgb_optuna.py" \
-            --data "${HCBC_OUT}" \
-            --out "${MODEL_BUNDLE}" \
-            --n-trials "${{ github.event.inputs.n_trials || 40 }}" \
-            --folds "${{ github.event.inputs.folds || 6 }}" \
-            --embargo-rows "${{ github.event.inputs.embargo_rows || 200 }}" \
-            --seed 42 2>&1 | tee "${ARTIFACT_DIR}/train.log"
-          test ${PIPESTATUS[0]} -eq 0
+          python - << 'PY' >"${ARTIFACT_DIR}/train.log" 2>&1
+          import os, json, numpy as np, pandas as pd
+          from sklearn.model_selection import TimeSeriesSplit
+          from sklearn.metrics import roc_auc_score, precision_recall_curve
+          from sklearn.impute import SimpleImputer
+          from sklearn.pipeline import Pipeline
+          from sklearn.compose import ColumnTransformer
+          from xgboost import XGBClassifier
+          import optuna, joblib
+
+          DATA = os.environ.get("HCBC_OUT", "artifacts/multiH_binary.csv")
+          MODEL_PATH = os.environ.get("MODEL_BUNDLE", "artifacts/xgb_hcbc.bundle.joblib")
+          N_TRIALS = int(os.environ.get("GITHUB_INPUT_N_TRIALS","40") or "40")
+          FOLDS = int(os.environ.get("GITHUB_INPUT_FOLDS","6") or "6")
+
+          df = pd.read_csv(DATA)
+          y = df["label_up"].astype(int)
+          X = df.drop(columns=[c for c in ["label_up","movement_type"] if c in df.columns])
+
+          num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+          X = X[num_cols]
+
+          # Drop constant/near-constant numeric cols (guards against any future zeros)
+          const = []; near_const = []
+          for c in list(X.columns):
+              col = X[c]
+              if col.nunique(dropna=False) <= 1:
+                  const.append(c)
+              else:
+                  std = float(col.std(ddof=0)) if len(col) > 1 else 0.0
+                  rng = float(col.max() - col.min()) if len(col) > 0 else 0.0
+                  if std == 0.0 or rng == 0.0:
+                      near_const.append(c)
+          drop_cols = sorted(set(const + near_const))
+          if drop_cols:
+              print(f"Dropping {len(drop_cols)} constant/near-constant columns:", drop_cols)
+              X = X.drop(columns=drop_cols)
+              num_cols = [c for c in num_cols if c not in drop_cols]
+          with open(os.path.join("artifacts","dropped_constant_features.json"),"w") as f:
+              json.dump(drop_cols, f, indent=2)
+
+          pre = ColumnTransformer([("num", SimpleImputer(strategy="median"), num_cols)], remainder="drop")
+          base_clf = XGBClassifier(
+              objective="binary:logistic",
+              tree_method="hist",
+              eval_metric="auc",
+              n_estimators=400,
+              random_state=42,
+              n_jobs=2,
+          )
+          pipe = Pipeline([("pre", pre), ("clf", base_clf)])
+          tss = TimeSeriesSplit(n_splits=FOLDS)
+
+          def trial_params(trial):
+              return dict(
+                  clf__learning_rate=trial.suggest_float("lr", 0.01, 0.3, log=True),
+                  clf__max_depth=trial.suggest_int("max_depth", 3, 10),
+                  clf__min_child_weight=trial.suggest_float("min_child_weight", 1.0, 10.0),
+                  clf__subsample=trial.suggest_float("subsample", 0.5, 1.0),
+                  clf__colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                  clf__reg_lambda=trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+                  clf__reg_alpha=trial.suggest_float("reg_alpha", 1e-5, 1.0, log=True),
+              )
+
+          def objective(trial):
+              params = trial_params(trial)
+              pipe.set_params(**params)
+              aucs = []
+              for tr_idx, va_idx in tss.split(X):
+                  Xtr, Xva = X.iloc[tr_idx], X.iloc[va_idx]
+                  ytr, yva = y.iloc[tr_idx], y.iloc[va_idx]
+                  pos = ytr.sum(); neg = len(ytr) - pos
+                  spw = float(neg)/float(pos) if pos > 0 else 1.0
+                  pipe.set_params(clf__scale_pos_weight=spw)
+                  pipe.fit(Xtr, ytr)
+                  pva = pipe.predict_proba(Xva)[:,1]
+                  from sklearn.metrics import roc_auc_score
+                  aucs.append(roc_auc_score(yva, pva))
+              return float(np.mean(aucs))
+
+          study = optuna.create_study(direction="maximize")
+          study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=False)
+          best_params = trial_params(study.best_trial)
+
+          pipe.set_params(**best_params)
+          pos = y.sum(); neg = len(y) - pos
+          pipe.set_params(clf__scale_pos_weight=(float(neg)/float(pos) if pos>0 else 1.0))
+          pipe.fit(X, y)
+
+          os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+          joblib.dump(dict(pipeline=pipe, features=num_cols, params=best_params), MODEL_PATH)
+
+          # Threshold via PR curve on CV
+          preds_all = []; t_all = []
+          for tr_idx, va_idx in tss.split(X):
+              pipe.set_params(**best_params)
+              ytr = y.iloc[tr_idx]
+              pos = ytr.sum(); neg = len(ytr) - pos
+              pipe.set_params(clf__scale_pos_weight=(float(neg)/float(pos) if pos>0 else 1.0))
+              pipe.fit(X.iloc[tr_idx], ytr)
+              p = pipe.predict_proba(X.iloc[va_idx])[:,1]
+              preds_all.append(p); t_all.append(y.iloc[va_idx].values)
+          import numpy as np
+          p = np.concatenate(preds_all); t = np.concatenate(t_all)
+          from sklearn.metrics import precision_recall_curve
+          pr, rc, th = precision_recall_curve(t, p)
+          f1 = (2*pr*rc)/(pr+rc+1e-12)
+          th_opt = float(th[np.nanargmax(f1)] if len(th)>0 else 0.5)
+
+          report = dict(best_value=study.best_value, best_params=best_params,
+                        n_features=len(num_cols), n_rows=int(len(X)),
+                        threshold_f1_opt=th_opt)
+          with open(os.path.join("artifacts","hcbc_cv_report.json"),"w") as f:
+              json.dump(report,f,indent=2)
+          with open(os.path.join("artifacts","hcbc_thresholds.json"),"w") as f:
+              json.dump({"f1_opt": th_opt, "default": 0.5}, f, indent=2)
+          with open(os.path.join("artifacts","hcbc_features.json"),"w") as f:
+              json.dump(num_cols, f, indent=2)
+          print("Training complete."); print(json.dumps(report, indent=2))
+          PY
+          cat "${ARTIFACT_DIR}/train.log"
           test -s "${MODEL_BUNDLE}"
 
-      # ===================== 5) UPLOAD ARTIFACTS ========================
+      # ── 5) Upload artifacts ───────────────────────────────────────────────────
       - name: Upload artifacts (bundle + reports + logs)
         uses: actions/upload-artifact@v4
         with:
@@ -261,13 +347,14 @@ jobs:
             artifacts/hcbc_cv_report.json
             artifacts/hcbc_thresholds.json
             artifacts/hcbc_features.json
+            artifacts/dropped_constant_features.json
             artifacts/prep.log
             artifacts/train.log
             artifacts/prepared_dataset.csv
             artifacts/multiH_binary.csv
           retention-days: 30
 
-      # ===================== 6) AWS: OIDC + S3 publish ==================
+      # ── 6) AWS publish (OIDC) ────────────────────────────────────────────────
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -290,7 +377,6 @@ jobs:
           KEY="$(echo "${ML_MODEL_PATH}" | sed 's@^s3://@@' | cut -d/ -f2-)"
           BASE_DIR="$(dirname "${KEY}")"
           PREFIX="s3://${BUCKET}/${BASE_DIR}/logs/${TS}"
-          echo "Uploading logs to ${PREFIX}"
           aws s3 cp "artifacts/prep.log"  "${PREFIX}/prep.log"  --only-show-errors || true
           aws s3 cp "artifacts/train.log" "${PREFIX}/train.log" --only-show-errors || true
           if [ -f "artifacts/prepared_dataset.csv" ]; then
