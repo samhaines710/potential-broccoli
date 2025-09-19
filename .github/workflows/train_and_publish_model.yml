@@ -15,6 +15,14 @@ on:
         description: 'Embargo rows between train/val'
         required: false
         default: '200'
+      horizon_h:
+        description: 'H value (lookahead horizon used for HCBC)'
+        required: false
+        default: '2'
+      drop_neutral:
+        description: 'Drop NEUTRAL rows from labels (true/false)'
+        required: false
+        default: 'true'
 
 permissions:
   contents: write
@@ -163,37 +171,61 @@ jobs:
             f.write(f"RAW_PREP_OUT={out_csv}\n")
           PY
 
-      # ===================== 3) ENSURE HCBC SCHEMA =======================
-      - name: Ensure HCBC schema (adds H + label_up)
+      # ===================== 3) ENSURE HCBC SCHEMA (INLINE) ==============
+      - name: Ensure HCBC schema (adds H + label_up inline)
         run: |
           set -euo pipefail
           SRC="${RAW_PREP_OUT:-artifacts/prepared_dataset.csv}"
+          H="${{ github.event.inputs.horizon_h }}"
+          DROP_NEUTRAL="${{ github.event.inputs.drop_neutral }}"
+
           if [ ! -s "${SRC}" ]; then
             echo "::error::Normalized CSV missing: ${SRC}"
             exit 1
           fi
 
-          # Python exits 0 if conversion is needed; 1 if already HCBC.
-          if python - << 'PY'
-          import pandas as pd, sys, os
-          p = os.environ.get("RAW_PREP_OUT","artifacts/prepared_dataset.csv")
-          df = pd.read_csv(p, nrows=1)
-          cols = set(c.lower() for c in df.columns)
-          sys.exit(0 if not {"h","label_up"} <= cols else 1)
-          PY
-          then
-            echo "Converting to HCBC via prepare_hcbc_dataset.py"
-            python "Grond-main 2/prepare_hcbc_dataset.py" \
-              --in "${SRC}" \
-              --out "${HCBC_OUT}" \
-              --h 2 \
-              --drop-neutral
-          else
-            echo "Source already has H & label_up; copying."
-            cp "${SRC}" "${HCBC_OUT}"
-          fi
+          python - << 'PY'
+          import os, sys, pandas as pd
+          src = os.environ.get("SRC")
+          out = os.environ.get("HCBC_OUT")
+          H = int(os.environ.get("H","2"))
+          drop_neutral = os.environ.get("DROP_NEUTRAL","true").lower() == "true"
 
-          test -s "${HCBC_OUT}"
+          df = pd.read_csv(src)
+          cols_lower = {c.lower() for c in df.columns}
+
+          # If already has both, just ensure types and write out
+          if {"h","label_up"} <= cols_lower:
+              # Normalize column names case-wise
+              rename = {c:c.lower() for c in df.columns}
+              df.rename(columns=rename, inplace=True)
+              if drop_neutral and "movement_type" in df.columns:
+                  df = df[df["movement_type"].str.upper() != "NEUTRAL"]
+              df.to_csv(out, index=False)
+              print(f"HCBC: passthrough existing schema → {out} rows={len(df)} cols={len(df.columns)}")
+              sys.exit(0)
+
+          # Build label_up from movement_type
+          if "movement_type" not in df.columns:
+              print("::error::No 'movement_type' column to derive label_up from.", file=sys.stderr)
+              sys.exit(2)
+
+          mt = df["movement_type"].astype(str).str.upper()
+          label_up = (mt == "CALL").astype(int)
+          if drop_neutral:
+              mask = mt.isin(["CALL","PUT"])
+              df = df.loc[mask].copy()
+              label_up = label_up.loc[mask]
+
+          df["label_up"] = label_up
+          df["H"] = H
+
+          df.to_csv(out, index=False)
+          print(f"HCBC: created label_up (CALL=1, PUT=0, drop_neutral={drop_neutral}) and H={H} → {out} rows={len(df)} cols={len(df.columns)}")
+          PY
+        env:
+          SRC: ${{ env.RAW_PREP_OUT }}
+          HCBC_OUT: ${{ env.HCBC_OUT }}
 
       - name: Show HCBC head (sanity)
         run: |
@@ -232,6 +264,7 @@ jobs:
             artifacts/prep.log
             artifacts/train.log
             artifacts/prepared_dataset.csv
+            artifacts/multiH_binary.csv
           retention-days: 30
 
       # ===================== 6) AWS: OIDC + S3 publish ==================
