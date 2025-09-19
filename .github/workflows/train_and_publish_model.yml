@@ -77,7 +77,7 @@ jobs:
           set -euo pipefail
           mkdir -p "Grond-main 2/data" "Grond-main 2/Resources" "${ARTIFACT_DIR}"
 
-      # 1) PREP (logs captured)
+      # ===================== 1) PREP (logs captured) =====================
       - name: Run prepare_training_data.py (Polygon)
         env:
           POLYGON_API_KEY: ${{ env.POLYGON_API_KEY }}
@@ -87,30 +87,48 @@ jobs:
           python "Grond-main 2/prepare_training_data.py" 2>&1 | tee "${ARTIFACT_DIR}/prep.log"
           test ${PIPESTATUS[0]} -eq 0
 
-      # 2) DISCOVER & NORMALIZE DATA
-      - name: Discover dataset under Grond-main 2/data and normalize to CSV
+      # If script wrote to ./data/, relocate it to Grond-main 2/data/ so discovery is deterministic.
+      - name: Relocate prepared dataset if needed
+        run: |
+          set -euo pipefail
+          if [ -f "data/movement_training_data.csv" ]; then
+            echo "Found ./data/movement_training_data.csv → moving into Grond-main 2/data/"
+            mkdir -p "Grond-main 2/data"
+            mv -f "data/movement_training_data.csv" "Grond-main 2/data/"
+          else
+            echo "No ./data/movement_training_data.csv to relocate (ok if prep wrote elsewhere)."
+          fi
+
+      # ===================== 2) DISCOVER & NORMALIZE =====================
+      - name: Discover dataset (data/ + Grond-main 2/data) and normalize to CSV
         run: |
           set -euo pipefail
           python - << 'PY'
-          import os, glob, sys
+          import os, glob, sys, hashlib
           import pandas as pd
-          data_dir = os.path.join("Grond-main 2", "data")
-          if not os.path.isdir(data_dir):
-            print(f"::error::Data directory missing: {data_dir}", file=sys.stderr)
-            sys.exit(1)
+
+          roots = ["Grond-main 2/data", "data"]
           patterns = ["*.csv", "*.parquet", "*.feather"]
-          cands = []
-          for pat in patterns:
-            cands.extend(glob.glob(os.path.join(data_dir, pat)))
-          if not cands:
-            print(f"::error::No files found in {data_dir}", file=sys.stderr)
+
+          candidates = []
+          for root in roots:
+            if not os.path.isdir(root):
+              continue
+            for pat in patterns:
+              candidates.extend(glob.glob(os.path.join(root, pat)))
+
+          if not candidates:
+            print("::error::No dataset files found under 'Grond-main 2/data' or './data'.", file=sys.stderr)
             sys.exit(1)
-          newest = max(cands, key=lambda p: os.path.getmtime(p))
-          root, ext = os.path.splitext(newest)
+
+          newest = max(candidates, key=lambda p: os.path.getmtime(p))
+          _, ext = os.path.splitext(newest)
+          ext = ext.lower()
+
           out_csv = os.path.join("artifacts", "prepared_dataset.csv")
           os.makedirs("artifacts", exist_ok=True)
+
           try:
-            ext = ext.lower()
             if ext == ".csv":
               df_head = pd.read_csv(newest, nrows=1)
               if df_head.empty:
@@ -132,31 +150,36 @@ jobs:
           except Exception as e:
             print(f"::error::Failed to normalize dataset {newest} to CSV: {e}", file=sys.stderr)
             sys.exit(1)
-          with open(os.environ["GITHUB_ENV"], "a") as f:
-            f.write(f"RAW_PREP_OUT={out_csv}\n")
+
+          # manifest + hand-off
+          with open(out_csv, "rb") as fh:
+            sha = hashlib.sha256(fh.read()).hexdigest()[:20]
           df = pd.read_csv(out_csv, nrows=200)
-          print("Discovered source:", newest)
-          print("Normalized CSV:", out_csv)
+          print(f"MANIFEST src={newest} rows≈{sum(1 for _ in open(out_csv))-1} cols={len(df.columns)} sha256={sha}")
           print("Columns:", df.columns.tolist())
           print(df.head(5).to_string())
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+            f.write(f"RAW_PREP_OUT={out_csv}\n")
           PY
 
-      # 3) ENSURE HCBC SCHEMA (adds H + label_up)
+      # ===================== 3) ENSURE HCBC SCHEMA =======================
       - name: Ensure HCBC schema (adds H + label_up)
         run: |
           set -euo pipefail
-          SRC="artifacts/prepared_dataset.csv"   # produced by previous step
+          SRC="${RAW_PREP_OUT:-artifacts/prepared_dataset.csv}"
           if [ ! -s "${SRC}" ]; then
             echo "::error::Normalized CSV missing: ${SRC}"
             exit 1
           fi
-          # Probe whether SRC already has H & label_up; return code drives the branch.
+
+          # Python exits 0 if conversion is needed; 1 if already HCBC.
           if python - << 'PY'
-          import pandas as pd
-          df = pd.read_csv("artifacts/prepared_dataset.csv", nrows=1)
-          cols = set(map(str.lower, df.columns))
-          # exit code 0 => needs conversion; 1 => already HCBC
-          import sys; sys.exit(0 if not {"h","label_up"} <= cols else 1)
+          import pandas as pd, sys, os
+          p = os.environ.get("RAW_PREP_OUT","artifacts/prepared_dataset.csv")
+          df = pd.read_csv(p, nrows=1)
+          cols = set(c.lower() for c in df.columns)
+          sys.exit(0 if not {"h","label_up"} <= cols else 1)
           PY
           then
             echo "Converting to HCBC via prepare_hcbc_dataset.py"
@@ -166,9 +189,10 @@ jobs:
               --h 2 \
               --drop-neutral
           else
-            echo "Source already has H & label_up; copying"
+            echo "Source already has H & label_up; copying."
             cp "${SRC}" "${HCBC_OUT}"
           fi
+
           test -s "${HCBC_OUT}"
 
       - name: Show HCBC head (sanity)
@@ -181,7 +205,7 @@ jobs:
           print(df.head(5).to_string())
           PY
 
-      # 4) TRAIN (logs captured)
+      # ===================== 4) TRAIN (logs captured) ====================
       - name: Train HCBC (XGBoost + Optuna)
         run: |
           set -euo pipefail
@@ -195,7 +219,7 @@ jobs:
           test ${PIPESTATUS[0]} -eq 0
           test -s "${MODEL_BUNDLE}"
 
-      # 5) UPLOAD ARTIFACTS
+      # ===================== 5) UPLOAD ARTIFACTS ========================
       - name: Upload artifacts (bundle + reports + logs)
         uses: actions/upload-artifact@v4
         with:
@@ -210,7 +234,7 @@ jobs:
             artifacts/prepared_dataset.csv
           retention-days: 30
 
-      # 6) AWS: OIDC + S3 publish
+      # ===================== 6) AWS: OIDC + S3 publish ==================
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
