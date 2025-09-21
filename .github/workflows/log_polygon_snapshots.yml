@@ -68,15 +68,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir requests pandas
 
-      - name: "Verify logger exists"
+      - name: "Resolve logger path"
+        id: resolve
         run: |
           set -euo pipefail
-          if [ -f "scripts/log_polygon_option_snapshots_csv.py" ]; then
-            echo "Logger exists at scripts/log_polygon_option_snapshots_csv.py"
+          CAND_ROOT="scripts/log_polygon_option_snapshots_csv.py"
+          CAND_GROND="Grond-main 2/scripts/log_polygon_option_snapshots_csv.py"
+          if [ -f "${CAND_ROOT}" ]; then
+            LOG_SCRIPT="${CAND_ROOT}"
+          elif [ -f "${CAND_GROND}" ]; then
+            LOG_SCRIPT="${CAND_GROND}"
           else
-            echo "::error::Missing scripts/log_polygon_option_snapshots_csv.py in repo."
+            echo "::error::Missing log_polygon_option_snapshots_csv.py at scripts/ or 'Grond-main 2/scripts/'."
+            echo "::error::Saw tree:"; ls -la; echo "::error::In Grond-main 2/scripts:"; ls -la "Grond-main 2/scripts" || true
             exit 1
           fi
+          echo "Resolved logger: ${LOG_SCRIPT}"
+          echo "LOG_SCRIPT=${LOG_SCRIPT}" >> "$GITHUB_ENV"
 
       - name: "Prepare output dir"
         run: |
@@ -98,10 +106,11 @@ jobs:
           MAX_EXPIRIES="${INP_MAX_EXPIRIES:-}"; : "${MAX_EXPIRIES:=4}"
 
           echo "Logger config -> duration_min=${DURATION_MIN}, poll_seconds=${POLL_SECONDS}, near_atm_pct=${NEAR_ATM_PCT}, max_expiries=${MAX_EXPIRIES}"
+          echo "Using script: ${LOG_SCRIPT}"
 
           END_TS=$(( $(date +%s) + DURATION_MIN*60 ))
           while [ "$(date +%s)" -lt "${END_TS}" ]; do
-            python "scripts/log_polygon_option_snapshots_csv.py" \
+            python "${LOG_SCRIPT}" \
               --out "${OUT_DIR}" \
               --poll "${POLL_SECONDS}" \
               --atm "${NEAR_ATM_PCT}" \
