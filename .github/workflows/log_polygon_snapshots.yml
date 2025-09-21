@@ -29,7 +29,6 @@ permissions:
 
 env:
   OUT_DIR: polygon_live_csv
-  # Optional AWS publish (leave empty to skip)
   AWS_REGION: ${{ secrets.AWS_REGION }}
   AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
   S3_SNAPSHOT_PREFIX: ${{ secrets.S3_SNAPSHOT_PREFIX }}
@@ -67,183 +66,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # if the script is already in the repo, this step is harmless; otherwise it writes it
-      - name: Ensure logger file exists (heredoc)
+      - name: Verify logger exists
         run: |
           set -euo pipefail
-          if [ -f "log_polygon_option_snapshots_csv.py" ]; then
-            echo "logger exists at repo root"
-          else
-            cat > log_polygon_option_snapshots_csv.py <<'PY'
-#!/usr/bin/env python3
-# (file content intentionally identical to the standalone version you added to the repo)
-# If you prefer not to duplicate, keep this heredoc; otherwise delete this step.
-from __future__ import annotations
-import argparse, csv, glob, importlib.util, os, sys, time, requests
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-DEF_OUT_DIR=os.getenv("OUT_DIR","polygon_live_csv"); DEF_POLL_SEC=int(os.getenv("POLL_SECONDS","15"))
-DEF_ATM_PCT=float(os.getenv("NEAR_ATM_PCT","0.05")); DEF_MAX_EXPS=int(os.getenv("MAX_EXPIRIES","4"))
-DEF_LOG_ERRORS=os.getenv("LOG_ERRORS","0")=="1"; API_KEY=os.getenv("POLYGON_API_KEY","")
-def now_utc_iso(): return datetime.now(timezone.utc).isoformat()
-def day_str(dt=None): d=dt or datetime.now(timezone.utc); return d.strftime("%Y-%m-%d")
-def ensure_dir(p): os.makedirs(p, exist_ok=True)
-def robust_float(x): 
-    try:
-        if x is None: return None
-        f=float(x); return None if (f!=f) else f
-    except: return None
-def robust_int(x):
-    try:
-        if x is None: return None
-        return int(x)
-    except: return None
-def calc_mid(b,a):
-    try:
-        if b is None or a is None or b<=0 or a<=0 or a<b: return None
-        return 0.5*(b+a)
-    except: return None
-def possible_repo_roots():
-    roots=[os.getcwd()]
-    for pat in ["./*/config.py","./*/*/config.py","./potential-broccoli*/config.py","./Grond*/config.py"]:
-        for hit in glob.glob(pat): roots.append(os.path.dirname(hit))
-    out, seen=[], set()
-    for r in roots:
-        rp=os.path.abspath(r)
-        if rp not in seen: seen.add(rp); out.append(rp)
-    return out
-def import_config_tickerset(root):
-    p=os.path.join(root,"config.py")
-    if not os.path.isfile(p): return None
-    spec=importlib.util.spec_from_file_location("repo_config", p)
-    if spec is None or spec.loader is None: return None
-    mod=importlib.util.module_from_spec(spec)
-    try: spec.loader.exec_module(mod)  # type: ignore
-    except Exception as e:
-        if DEF_LOG_ERRORS: print(f"[WARN] import config.py failed at {p}: {e}", file=sys.stderr)
-        return None
-    tickers=getattr(mod,"TICKERS",None)
-    if not tickers: return None
-    try:
-        norm=[str(t).strip().upper() for t in tickers if str(t).strip()]
-        norm=[t for t in norm if all(c.isalnum() or c in ('.','-','_') for c in t)]
-        return sorted(set(norm))
-    except: return None
-def load_universe(cli_symbols):
-    for root in possible_repo_roots():
-        t=import_config_tickerset(root)
-        if t: print(f"[info] Using TICKERS from {root}/config.py: {len(t)} symbols"); return t
-    if cli_symbols:
-        syms=sorted(set(s.strip().upper() for s in cli_symbols.split(",") if s.strip()))
-        if syms: print(f"[info] Using --symbols override: {len(syms)} symbols"); return syms
-    env_syms=os.getenv("UNDERLYINGS","")
-    syms=sorted(set(s.strip().upper() for s in env_syms.split(",") if s.strip()))
-    if syms: print(f"[info] Using UNDERLYINGS env: {len(syms)} symbols"); return syms
-    print("ERROR: No symbols found. Provide config.py TICKERS, --symbols, or UNDERLYINGS.", file=sys.stderr); sys.exit(1)
-def polygon_get(url, params):
-    p=dict(params); p["apiKey"]=API_KEY
-    r=requests.get(url, params=p, timeout=10); r.raise_for_status(); return r.json()
-def pick_underlying_price(js):
-    u=js.get("underlying_asset") or {}; return robust_float(u.get("price"))
-def extract_contract_rows(underlying, js, near_atm_pct, max_expiries):
-    ingest_ts=now_utc_iso(); raw=js.get("results") or js.get("options") or js.get("contracts") or []
-    S=pick_underlying_price(js); norm=[]
-    for o in raw:
-        try:
-            det=o.get("details",{}); typ=(det.get("contract_type") or o.get("contract_type") or "").upper()
-            if typ not in ("CALL","PUT"): continue
-            expiry=det.get("expiration_date") or o.get("expiration_date") or o.get("expiry")
-            strike=robust_float(det.get("strike_price") or o.get("strike_price"))
-            q=o.get("quote") or {}; bid=robust_float(q.get("bid") if q else o.get("bid"))
-            ask=robust_float(q.get("ask") if q else o.get("ask"))
-            bidz=robust_int(q.get("bid_size") or o.get("bid_size")); askz=robust_int(q.get("ask_size") or o.get("ask_size"))
-            greeks=o.get("greeks") or o.get("day") or {}
-            iv=robust_float(greeks.get("iv") or greeks.get("implied_volatility"))
-            delta=robust_float(greeks.get("delta")); gamma=robust_float(greeks.get("gamma"))
-            theta=robust_float(greeks.get("theta")); vega=robust_float(greeks.get("vega")); rho=robust_float(greeks.get("rho"))
-            if expiry is None or strike is None: continue
-            mid=calc_mid(bid,ask); if mid is None: continue
-            norm.append({"ts_iso":ingest_ts,"ingest_ts_iso":ingest_ts,"symbol_underlying":underlying.upper(),
-                        "underlying_price":S,"expiry":str(expiry),"type":"C" if typ=="CALL" else "P","strike":strike,
-                        "bid":bid,"ask":ask,"mid":mid,"bid_size":bidz,"ask_size":askz,
-                        "iv":iv,"delta":delta,"gamma":gamma,"theta":theta,"vega":vega,"rho":rho})
-        except Exception:
-            if DEF_LOG_ERRORS: print(f"[WARN] normalize failed for one {underlying} contract", file=sys.stderr)
-            continue
-    if not norm: return []
-    expiries=sorted({r["expiry"] for r in norm}); keep=set(expiries[:max_expiries])
-    norm=[r for r in norm if r["expiry"] in keep]
-    return [r for r in norm if (S is None) or abs((r["strike"]-S)/S) <= near_atm_pct]
-def ensure_dir(p): os.makedirs(p, exist_ok=True)
-def write_rows_csv(path, rows):
-    if not rows: return
-    seen=set(); dedup=[]
-    for r in rows:
-        k=(r["ts_iso"], r["expiry"], r["type"], r["strike"])
-        if k not in seen: seen.add(k); dedup.append(r)
-    write_header=not os.path.exists(path); ensure_dir(os.path.dirname(path))
-    cols=["ts_iso","ingest_ts_iso","symbol_underlying","underlying_price","expiry","type","strike","bid","ask","mid",
-          "bid_size","ask_size","iv","delta","gamma","theta","vega","rho"]
-    with open(path,"a",newline="") as f:
-        w=csv.DictWriter(f, fieldnames=cols)
-        if write_header: w.writeheader()
-        for r in dedup: w.writerow(r)
-def fetch_and_log_once(underlying, out_dir, near_atm_pct, max_expiries):
-    url=f"https://api.polygon.io/v3/snapshot/options/{underlying.upper()}"
-    try: js=polygon_get(url, params={"limit":1000})
-    except requests.HTTPError as e:
-        code=getattr(e.response,"status_code",None)
-        if DEF_LOG_ERRORS: print(f"[HTTP {code}] {underlying} snapshot failed", file=sys.stderr)
-        return 0
-    except Exception as e:
-        if DEF_LOG_ERRORS: print(f"[ERR] {underlying} snapshot error: {e}", file=sys.stderr)
-        return 0
-    rows=extract_contract_rows(underlying, js, near_atm_pct, max_expiries)
-    if not rows: return 0
-    sym_dir=os.path.join(out_dir,underlying.upper()); ensure_dir(sym_dir)
-    path=os.path.join(sym_dir, f"{day_str()}.csv"); write_rows_csv(path, rows); return len(rows)
-def parse_args():
-    ap=argparse.ArgumentParser()
-    ap.add_argument("--symbols", default=None)
-    ap.add_argument("--out", default=os.getenv("OUT_DIR","polygon_live_csv"))
-    ap.add_argument("--poll", type=int, default=int(os.getenv("POLL_SECONDS","15")))
-    ap.add_argument("--atm", type=float, default=float(os.getenv("NEAR_ATM_PCT","0.05")))
-    ap.add_argument("--exp", type=int, default=int(os.getenv("MAX_EXPIRIES","4")))
-    return ap.parse_args()
-def main():
-    if not API_KEY:
-        print("ERROR: POLYGON_API_KEY is not set.", file=sys.stderr); sys.exit(1)
-    args=parse_args()
-    # universe
-    syms=None
-    for root in [os.getcwd()]:
-        t=import_config_tickerset(root)
-        if t: syms=t; break
-    if not syms:
-        if args.symbols:
-            syms=sorted(set(s.strip().upper() for s in args.symbols.split(",") if s.strip()))
-        else:
-            env=os.getenv("UNDERLYINGS","")
-            syms=sorted(set(s.strip().upper() for s in env.split(",") if s.strip()))
-    if not syms:
-        print("ERROR: No symbols found (config.py/--symbols/UNDERLYINGS).", file=sys.stderr); sys.exit(1)
-    out_dir=args.out; poll_s=max(1,int(args.poll))
-    print(f"[start] symbols={syms} poll={poll_s}s atm={args.atm:.3f} exp={args.exp} out={out_dir}")
-    ensure_dir(out_dir)
-    try:
-        while True:
-            t0=time.time(); total=0
-            for sym in syms: total+=fetch_and_log_once(sym, out_dir, args.atm, args.exp)
-            el=time.time()-t0; sleep_s=max(poll_s-el,1.0)
-            print(f"[{now_utc_iso()}] wrote_rows={total}, cycle_s={el:.2f}, sleep_s={sleep_s:.2f}")
-            time.sleep(sleep_s)
-    except KeyboardInterrupt:
-        print("\n[stop] KeyboardInterrupt")
-if __name__=="__main__": main()
-PY
-            chmod +x log_polygon_option_snapshots_csv.py
-            echo "logger created via heredoc"
-          fi
+          test -s "log_polygon_option_snapshots_csv.py" || {
+            echo "::error::log_polygon_option_snapshots_csv.py not found at repo root."
+            exit 1
+          }
 
       - name: Prepare output dir
         run: |
@@ -269,14 +98,12 @@ PY
               --poll "${POLL_SECONDS}" \
               --atm "${NEAR_ATM_PCT}" \
               --exp "${MAX_EXPIRIES}" || true
-            # restart on exit until END_TS
             sleep 2
           done
 
       - name: Sanity check: sample rows & zero/NaN scan
         run: |
           set -euo pipefail
-
           NEWEST="$(ls -1t "${OUT_DIR}"/*/*.csv 2>/dev/null | head -n1 || true)"
           if [ -z "${NEWEST}" ] || [ ! -f "${NEWEST}" ]; then
             echo "::error::No CSVs found under ${OUT_DIR}/"
@@ -288,9 +115,6 @@ PY
           head -n 15 "${NEWEST}"
 
           echo "---- BASIC STATS (awk) ----"
-          # Columns (1-indexed): ts_iso(1), ingest_ts_iso(2), symbol(3), under_px(4),
-          # expiry(5), type(6), strike(7), bid(8), ask(9), mid(10),
-          # bid_size(11), ask_size(12), iv(13), delta(14), gamma(15), theta(16), vega(17), rho(18)
           awk -F, '
             BEGIN{
               iv_zero=delta_zero=gamma_zero=theta_zero=vega_zero=rho_zero=0;
@@ -300,7 +124,6 @@ PY
             NR==1{next}
             {
               rows++;
-              # Empty / NaN checks for IV/Greeks
               if($13=="" || $13=="NA" || $13=="NaN") iv_empty++;
               if($14=="" || $14=="NA" || $14=="NaN") delta_empty++;
               if($15=="" || $15=="NA" || $15=="NaN") gamma_empty++;
@@ -308,7 +131,6 @@ PY
               if($17=="" || $17=="NA" || $17=="NaN") vega_empty++;
               if($18=="" || $18=="NA" || $18=="NaN") rho_empty++;
 
-              # Zeros
               if($13=="0" || $13=="0.0") iv_zero++;
               if($14=="0" || $14=="0.0") delta_zero++;
               if($15=="0" || $15=="0.0") gamma_zero++;
