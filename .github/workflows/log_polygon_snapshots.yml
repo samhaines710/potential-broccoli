@@ -20,8 +20,7 @@ on:
         required: false
         default: "4"
   schedule:
-    # Weekdays 14:30 UTC (09:30 ET) as a default start; adjust as you wish.
-    - cron: "30 14 * * 1-5"
+    - cron: "30 14 * * 1-5"   # Weekdays 14:30 UTC (09:30 ET)
 
 permissions:
   contents: read
@@ -29,7 +28,6 @@ permissions:
 
 env:
   OUT_DIR: polygon_live_csv
-  # read-only env mirrors of secrets for bash checks later
   POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
   AWS_REGION: ${{ secrets.AWS_REGION }}
   AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
@@ -37,21 +35,20 @@ env:
 
 jobs:
   log-snapshots:
-    name: log-snapshots
     runs-on: ubuntu-latest
     environment: CI
     timeout-minutes: 480
 
     steps:
-      - name: Set up job
+      - name: "Set up job"
         run: echo "Starting Polygon snapshot logger…"
 
-      - name: Checkout
+      - name: "Checkout"
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Assert POLYGON_API_KEY present
+      - name: "Assert POLYGON_API_KEY present"
         run: |
           set -euo pipefail
           if [ -z "${POLYGON_API_KEY:-}" ]; then
@@ -60,18 +57,18 @@ jobs:
           fi
           echo "POLYGON_API_KEY detected."
 
-      - name: Setup Python
+      - name: "Setup Python"
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install runtime deps
+      - name: "Install runtime deps"
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install --no-cache-dir requests pandas
 
-      - name: Verify logger exists
+      - name: "Verify logger exists"
         run: |
           set -euo pipefail
           if [ -f "scripts/log_polygon_option_snapshots_csv.py" ]; then
@@ -81,12 +78,12 @@ jobs:
             exit 1
           fi
 
-      - name: Prepare output dir
+      - name: "Prepare output dir"
         run: |
           set -euo pipefail
           mkdir -p "${OUT_DIR}"
 
-      - name: Run live logger loop
+      - name: "Run live logger loop"
         env:
           INP_DURATION_MIN: ${{ github.event.inputs.duration_min }}
           INP_POLL_SECONDS: ${{ github.event.inputs.poll_seconds }}
@@ -95,7 +92,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Defaults handled in bash to avoid GH ternary expressions
           DURATION_MIN="${INP_DURATION_MIN:-}"; : "${DURATION_MIN:=30}"
           POLL_SECONDS="${INP_POLL_SECONDS:-}"; : "${POLL_SECONDS:=15}"
           NEAR_ATM_PCT="${INP_NEAR_ATM_PCT:-}"; : "${NEAR_ATM_PCT:=0.05}"
@@ -113,7 +109,7 @@ jobs:
             sleep "${POLL_SECONDS}"
           done
 
-      - name: Sanity check: sample rows & zero/NaN scan
+      - name: "Sanity check: sample rows & zero/NaN scan"
         run: |
           set -euo pipefail
           python - << 'PY'
@@ -126,39 +122,37 @@ jobs:
           newest=files[-1]
           df=pd.read_csv(newest)
           print(f"NEWEST={newest} rows={len(df)} cols={len(df.columns)}")
-          # quick quality scan
           zero_cols=[]
           for c in ["bid","ask","mid","implied_volatility","delta","gamma","theta","vega","rho","open_interest","volume"]:
             if c in df.columns and (df[c].fillna(0)==0).all():
               zero_cols.append(c)
           print("ZERO_COLUMNS:", json.dumps(zero_cols))
-          print("HEAD:\n", df.head(10).to_string(index=False))
+          print("HEAD:\n" + df.head(10).to_string(index=False))
           PY
 
-      - name: Upload CSVs as artifact (daily)
+      - name: "Upload CSVs as artifact (daily)"
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: polygon_option_snapshots_csv
-          path: |
-            polygon_live_csv/**/snapshot_*.csv
+          path: polygon_live_csv/**/snapshot_*.csv
           retention-days: 7
 
-      - name: Normalize optional AWS env
+      - name: "Normalize optional AWS env"
         run: |
           set -euo pipefail
           if [ -n "${AWS_REGION:-}" ]; then echo "AWS_REGION=${AWS_REGION}"; else echo "AWS_REGION not set; S3 upload will be skipped."; fi
           if [ -n "${AWS_ROLE_ARN:-}" ]; then echo "AWS_ROLE_ARN is set."; else echo "AWS_ROLE_ARN not set; S3 upload will be skipped."; fi
           if [ -n "${S3_SNAPSHOT_PREFIX:-}" ]; then echo "S3_SNAPSHOT_PREFIX=${S3_SNAPSHOT_PREFIX}"; else echo "S3_SNAPSHOT_PREFIX not set; S3 upload will be skipped."; fi
 
-      - name: (Optional) Configure AWS (OIDC)
+      - name: "(Optional) Configure AWS (OIDC)"
         if: ${{ env.AWS_REGION != '' && env.AWS_ROLE_ARN != '' && env.S3_SNAPSHOT_PREFIX != '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: (Optional) Sync CSVs to S3
+      - name: "(Optional) Sync CSVs to S3"
         if: ${{ env.AWS_REGION != '' && env.AWS_ROLE_ARN != '' && env.S3_SNAPSHOT_PREFIX != '' }}
         run: |
           set -euo pipefail
