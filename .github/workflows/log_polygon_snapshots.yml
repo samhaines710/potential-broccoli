@@ -29,6 +29,13 @@ permissions:
 
 env:
   OUT_DIR: polygon_live_csv
+  # pass-throughs (raw) – default in bash later
+  INP_DURATION_MIN: ${{ github.event.inputs.duration_min }}
+  INP_POLL_SECONDS: ${{ github.event.inputs.poll_seconds }}
+  INP_NEAR_ATM_PCT: ${{ github.event.inputs.near_atm_pct }}
+  INP_MAX_EXPIRIES: ${{ github.event.inputs.max_expiries }}
+
+  # Optional publish to S3
   AWS_REGION: ${{ secrets.AWS_REGION }}
   AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
   S3_SNAPSHOT_PREFIX: ${{ secrets.S3_SNAPSHOT_PREFIX }}
@@ -83,14 +90,21 @@ jobs:
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
           OUT_DIR: ${{ env.OUT_DIR }}
+          INP_DURATION_MIN: ${{ env.INP_DURATION_MIN }}
+          INP_POLL_SECONDS: ${{ env.INP_POLL_SECONDS }}
+          INP_NEAR_ATM_PCT: ${{ env.INP_NEAR_ATM_PCT }}
+          INP_MAX_EXPIRIES: ${{ env.INP_MAX_EXPIRIES }}
         run: |
           set -euo pipefail
-          DURATION_MIN="${{ github.event.inputs.duration_min || '420' }}"
-          POLL_SECONDS="${{ github.event.inputs.poll_seconds || '15' }}"
-          NEAR_ATM_PCT="${{ github.event.inputs.near_atm_pct || '0.05' }}"
-          MAX_EXPIRIES="${{ github.event.inputs.max_expiries || '4' }}"
+
+          # Defaults handled in bash (avoid GH expression ternaries in YAML)
+          DURATION_MIN="${INP_DURATION_MIN:-}"; : "${DURATION_MIN:=420}"
+          POLL_SECONDS="${INP_POLL_SECONDS:-}"; : "${POLL_SECONDS:=15}"
+          NEAR_ATM_PCT="${INP_NEAR_ATM_PCT:-}"; : "${NEAR_ATM_PCT:=0.05}"
+          MAX_EXPIRIES="${INP_MAX_EXPIRIES:-}"; : "${MAX_EXPIRIES:=4}"
 
           echo "Runner will poll for ${DURATION_MIN} minutes; poll=${POLL_SECONDS}s; atm=${NEAR_ATM_PCT}; expiries=${MAX_EXPIRIES}"
+
           END_TS=$(( $(date +%s) + DURATION_MIN*60 ))
           while [ "$(date +%s)" -lt "${END_TS}" ]; do
             python "log_polygon_option_snapshots_csv.py" \
@@ -101,9 +115,10 @@ jobs:
             sleep 2
           done
 
-      - name: Sanity check: sample rows & zero/NaN scan
+      - name: "Sanity check: sample rows & zero/NaN scan"
         run: |
           set -euo pipefail
+
           NEWEST="$(ls -1t "${OUT_DIR}"/*/*.csv 2>/dev/null | head -n1 || true)"
           if [ -z "${NEWEST}" ] || [ ! -f "${NEWEST}" ]; then
             echo "::error::No CSVs found under ${OUT_DIR}/"
@@ -186,15 +201,26 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
+      - name: Normalize optional AWS env
+        if: ${{ env.AWS_ROLE_ARN != '' && env.S3_SNAPSHOT_PREFIX != '' }}
+        run: |
+          set -euo pipefail
+          # If AWS_REGION is empty, set a safe default to avoid YAML expression tricks.
+          if [ -z "${AWS_REGION:-}" ]; then
+            echo "AWS_REGION=us-east-1" >> "$GITHUB_ENV"
+          else
+            echo "AWS_REGION=${AWS_REGION}" >> "$GITHUB_ENV"
+          fi
+
       - name: (Optional) Configure AWS (OIDC)
-        if: ${{ env.AWS_ROLE_ARN && env.S3_SNAPSHOT_PREFIX }}
+        if: ${{ env.AWS_ROLE_ARN != '' && env.S3_SNAPSHOT_PREFIX != '' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION || 'us-east-1' }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: (Optional) Sync CSVs to S3
-        if: ${{ env.AWS_ROLE_ARN && env.S3_SNAPSHOT_PREFIX }}
+        if: ${{ env.AWS_ROLE_ARN != '' && env.S3_SNAPSHOT_PREFIX != '' }}
         run: |
           set -euo pipefail
           echo "Syncing ${OUT_DIR} -> ${S3_SNAPSHOT_PREFIX}"
