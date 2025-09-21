@@ -1,0 +1,163 @@
+name: Log Polygon Option Snapshots (CSV)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_min:
+        description: "Run duration in minutes (RTH ~ 390)."
+        required: false
+        default: "420"
+      poll_seconds:
+        description: "Polling interval seconds."
+        required: false
+        default: "15"
+      near_atm_pct:
+        description: "ATM band (e.g., 0.05 = 5%)."
+        required: false
+        default: "0.05"
+      max_expiries:
+        description: "Nearest expiries to keep."
+        required: false
+        default: "4"
+  schedule:
+    # Run once at US RTH open (14:30 UTC) on trading days; job itself loops for duration_min
+    - cron: "30 14 * * 1-5"
+
+permissions:
+  contents: read
+  id-token: write   # for optional AWS OIDC
+  actions: read
+
+env:
+  # Output directory (checked into runner workspace only; not committed to repo)
+  OUT_DIR: polygon_live_csv
+
+  # Optional AWS publish (leave empty to skip)
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  S3_SNAPSHOT_PREFIX: ${{ secrets.S3_SNAPSHOT_PREFIX }}
+  # Example S3_SNAPSHOT_PREFIX: s3://my-bucket/polygon_snapshots
+
+jobs:
+  log-snapshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480   # 8h ceiling; we stop earlier via duration_min
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assert POLYGON_API_KEY present
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${POLYGON_API_KEY:-}" ]; then
+            echo "::error::POLYGON_API_KEY secret is missing."
+            exit 1
+          fi
+          echo "OK: POLYGON_API_KEY present (hidden)."
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Locate universe (repo config.py) and logger script
+        id: paths
+        run: |
+          set -euo pipefail
+          # Detect a repo root that contains config.py (for TICKERS)
+          ROOT=""
+          for p in "." ./* "./potential-broccoli*" "./Grond*" ; do
+            if [ -f "${p}/config.py" ]; then ROOT="${p}"; break; fi
+          done
+          if [ -z "${ROOT}" ]; then
+            echo "::warning::No config.py found; logger will fall back to UNDERLYINGS env or --symbols."
+          else
+            echo "Repo root with config.py: ${ROOT}"
+          fi
+          # Verify logger script path exists
+          SCRIPT_CANDIDATES=(
+            "log_polygon_option_snapshots_csv.py"
+            "${ROOT}/log_polygon_option_snapshots_csv.py"
+            "scripts/log_polygon_option_snapshots_csv.py"
+            "${ROOT}/scripts/log_polygon_option_snapshots_csv.py"
+          )
+          SCRIPT=""
+          for s in "${SCRIPT_CANDIDATES[@]}"; do
+            if [ -f "${s}" ]; then SCRIPT="${s}"; break; fi
+          done
+          if [ -z "${SCRIPT}" ]; then
+            echo "::error::log_polygon_option_snapshots_csv.py not found in repo root or scripts/. Add the file exactly as previously provided."
+            exit 1
+          fi
+          echo "script=${SCRIPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare output dir
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUT_DIR}"
+
+      - name: Run live logger loop
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          OUT_DIR: ${{ env.OUT_DIR }}
+          # If you prefer a fixed universe override, set UNDERLYINGS in repo or env
+          # UNDERLYINGS: "AAPL,MSFT,NVDA,TSLA,SPY"
+        run: |
+          set -euo pipefail
+          DURATION_MIN="${{ github.event.inputs.duration_min || '420' }}"
+          POLL_SECONDS="${{ github.event.inputs.poll_seconds || '15' }}"
+          NEAR_ATM_PCT="${{ github.event.inputs.near_atm_pct || '0.05' }}"
+          MAX_EXPIRIES="${{ github.event.inputs.max_expiries || '4' }}"
+
+          echo "Runner will poll for ${DURATION_MIN} minutes; poll=${POLL_SECONDS}s; atm=${NEAR_ATM_PCT}; expiries=${MAX_EXPIRIES}"
+          END_TS=$(( $(date +%s) + DURATION_MIN*60 ))
+
+          # Launch the Python logger in the background under a watchdog loop
+          while [ "$(date +%s)" -lt "${END_TS}" ]; do
+            python "${{ steps.paths.outputs.script }}" \
+              --out "${OUT_DIR}" \
+              --poll "${POLL_SECONDS}" \
+              --atm "${NEAR_ATM_PCT}" \
+              --exp "${MAX_EXPIRIES}" &
+            PID=$!
+            # Sleep one poll cycle plus buffer, then check health
+            sleep "${POLL_SECONDS}"
+            # Let it run; if it exits, restart until END_TS
+            wait ${PID} || true
+            # short backoff to avoid tight restart loops
+            sleep 2
+          done
+
+      - name: Upload CSVs as artifact (daily)
+        uses: actions/upload-artifact@v4
+        with:
+          name: polygon_live_csv_${{ github.run_id }}
+          path: |
+            ${{ env.OUT_DIR }}/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: (Optional) Configure AWS (OIDC)
+        if: ${{ env.AWS_ROLE_ARN && env.S3_SNAPSHOT_PREFIX }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION || 'us-east-1' }}
+
+      - name: (Optional) Sync CSVs to S3
+        if: ${{ env.AWS_ROLE_ARN && env.S3_SNAPSHOT_PREFIX }}
+        run: |
+          set -euo pipefail
+          echo "Syncing ${OUT_DIR} -> ${S3_SNAPSHOT_PREFIX}"
+          aws s3 sync "${OUT_DIR}/" "${S3_SNAPSHOT_PREFIX}/" --only-show-errors
