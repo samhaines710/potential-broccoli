@@ -14,7 +14,7 @@ on:
       near_atm_pct:
         description: "Near-ATM band as fraction (e.g. 0.05 = ±5%)"
         required: false
-        default: "0.05"
+        default: "0.20"
       max_expiries:
         description: "Number of nearest expiries to keep"
         required: false
