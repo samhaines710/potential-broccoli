@@ -6,7 +6,7 @@ on:
       duration_min:
         description: "Run duration in minutes"
         required: false
-        default: "30"
+        default: "390"          # 6.5 hours (RTH)
       poll_seconds:
         description: "Poll interval (seconds)"
         required: false
@@ -20,7 +20,11 @@ on:
         required: false
         default: "4"
   schedule:
-    - cron: "30 14 * * 1-5"   # Weekdays 14:30 UTC (09:30 ET)
+    # Fire at 13:30 and 14:30 UTC.
+    # 13:30 UTC = 15:30 SAST (RSA) = 09:30 ET during EDT
+    # 14:30 UTC = 16:30 SAST (RSA) = 09:30 ET during EST
+    - cron: "30 13 * * 1-5"
+    - cron: "30 14 * * 1-5"
 
 permissions:
   contents: read
@@ -66,10 +70,36 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install --no-cache-dir requests pandas
+          pip install --no-cache-dir requests pandas holidays
+
+      # Gate so only *real* US RTH runs proceed (handles DST + US holidays)
+      - name: "Market-hours gate (US RTH 09:30–16:00 ET)"
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          from datetime import datetime, time
+          import os, sys
+          try:
+            from zoneinfo import ZoneInfo
+          except Exception:
+            import pytz as _p; ZoneInfo=lambda name:_p.timezone(name)  # fallback
+          try:
+            from holidays import US
+            us_holidays = US()
+          except Exception:
+            us_holidays = set()  # if pkg missing, don't block
+          tz = ZoneInfo("America/New_York")
+          now = datetime.now(tz)
+          start, end = time(9,30), time(16,0)
+          run = (now.weekday() < 5) and (now.date() not in us_holidays) and (start <= now.time() <= end)
+          print(f"Now ET={now.isoformat()} run={run}")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+            f.write(f"RUN_RTH={'1' if run else '0'}\n")
+          PY
 
       - name: "Resolve logger path"
         id: resolve
+        if: env.RUN_RTH == '1'
         run: |
           set -euo pipefail
           CAND_ROOT="scripts/log_polygon_option_snapshots_csv.py"
@@ -80,18 +110,19 @@ jobs:
             LOG_SCRIPT="${CAND_GROND}"
           else
             echo "::error::Missing log_polygon_option_snapshots_csv.py at scripts/ or 'Grond-main 2/scripts/'."
-            echo "::error::Saw tree:"; ls -la; echo "::error::In Grond-main 2/scripts:"; ls -la "Grond-main 2/scripts" || true
             exit 1
           fi
           echo "Resolved logger: ${LOG_SCRIPT}"
           echo "LOG_SCRIPT=${LOG_SCRIPT}" >> "$GITHUB_ENV"
 
       - name: "Prepare output dir"
+        if: env.RUN_RTH == '1'
         run: |
           set -euo pipefail
           mkdir -p "${OUT_DIR}"
 
       - name: "Run live logger loop"
+        if: env.RUN_RTH == '1'
         env:
           INP_DURATION_MIN: ${{ github.event.inputs.duration_min }}
           INP_POLL_SECONDS: ${{ github.event.inputs.poll_seconds }}
@@ -99,15 +130,12 @@ jobs:
           INP_MAX_EXPIRIES: ${{ github.event.inputs.max_expiries }}
         run: |
           set -euo pipefail
-
-          DURATION_MIN="${INP_DURATION_MIN:-}"; : "${DURATION_MIN:=30}"
+          DURATION_MIN="${INP_DURATION_MIN:-}"; : "${DURATION_MIN:=390}"
           POLL_SECONDS="${INP_POLL_SECONDS:-}"; : "${POLL_SECONDS:=15}"
           NEAR_ATM_PCT="${INP_NEAR_ATM_PCT:-}"; : "${NEAR_ATM_PCT:=0.05}"
           MAX_EXPIRIES="${INP_MAX_EXPIRIES:-}"; : "${MAX_EXPIRIES:=4}"
-
           echo "Logger config -> duration_min=${DURATION_MIN}, poll_seconds=${POLL_SECONDS}, near_atm_pct=${NEAR_ATM_PCT}, max_expiries=${MAX_EXPIRIES}"
           echo "Using script: ${LOG_SCRIPT}"
-
           END_TS=$(( $(date +%s) + DURATION_MIN*60 ))
           while [ "$(date +%s)" -lt "${END_TS}" ]; do
             python "${LOG_SCRIPT}" \
@@ -119,6 +147,7 @@ jobs:
           done
 
       - name: "Sanity check: sample rows & zero/NaN scan"
+        if: env.RUN_RTH == '1'
         run: |
           set -euo pipefail
           python - << 'PY'
