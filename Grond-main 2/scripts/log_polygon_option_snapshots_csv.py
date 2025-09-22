@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 """
 Log Polygon option snapshots to CSV (near-ATM, nearest expiries).
-- Pulls per-underlying snapshots from Polygon's v3 Options Snapshot endpoint.
+
+- Pulls per-underlying snapshots from Polygon's v3 Options Snapshot endpoint:
+    GET /v3/snapshot/options/{UNDERLYING}
+  (Note: NO 'O:' prefix here; 'O:' is only for **contract** symbols.)
+
 - Filters to contracts near-ATM by % moneyness and keeps N nearest expiries.
 - Writes a timestamped CSV per run under: {OUT_DIR}/{SYMBOL}/{YYYY-MM-DD}/snapshot_{ISO}.csv
 
 Usage (env + CLI):
+
   POLYGON_API_KEY=... python scripts/log_polygon_option_snapshots_csv.py \
       --out polygon_live_csv --poll 15 --atm 0.05 --exp 4
 
 Notes:
-- No historical OPRA; this logs *live snapshots* (whatever Polygon exposes off-hours will be whatever the API returns).
-- Resilient to missing Greeks/IV; it writes empty fields rather than exploding.
-- Tickers: tries to import config.TICKERS, else falls back to a sensible default mega-cap set.
+- This is *live* snapshots; there is no historical OPRA via Polygon.
+- Resilient to missing Greeks/IV; it writes empty fields rather than failing.
+- Tickers: tries to import config.TICKERS; else falls back to a sensible default.
 
-Schema (first 24 columns):
+Schema (first columns):
   symbol, underlying_price, contract_symbol, contract_type, strike, expiration_date, exercise_style,
-  bid, ask, mid, last_price, last_size, implied_volatility,
-  delta, gamma, theta, vega, rho,
-  open_interest, volume,
-  updated_at, source, underlying_change_pct, moneyness_abs, distance_to_expiry_days
-
+  bid, ask, mid, last_price, last_size, implied_volatility, delta, gamma, theta, vega, rho,
+  open_interest, volume, updated_at, source, moneyness_abs, distance_to_expiry_days
 """
 
 from __future__ import annotations
@@ -28,99 +30,134 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-API_BASE = "https://api.polygon.io"
+# ----------------------- Config / env -----------------------
 
-# ---------------------------- utils ----------------------------
+API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
+if not API_KEY:
+    sys.stderr.write("FATAL: POLYGON_API_KEY missing in environment.\n")
+    sys.exit(2)
 
-def robust_float(x: Any) -> Optional[float]:
+BASE = "https://api.polygon.io"
+SESSION = requests.Session()
+
+# Try to import user repo tickers; fall back if missing.
+DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "TSLA", "NFLX", "GOOG", "IBIT"]
+try:
+    # Support both possible repo layouts
     try:
-        if x is None:
+        from config import TICKERS as REPO_TICKERS  # type: ignore
+    except Exception:
+        from Grond_main_2.config import TICKERS as REPO_TICKERS  # type: ignore  # noqa: N816
+    TICKERS: List[str] = [t for t in REPO_TICKERS if isinstance(t, str) and t.strip()]
+    if not TICKERS:
+        TICKERS = DEFAULT_TICKERS
+except Exception:
+    TICKERS = DEFAULT_TICKERS
+
+
+# ----------------------- HTTP helpers -----------------------
+
+def fetch_underlying_snapshot(
+    underlying: str,
+    *,
+    limit: int = 1000,
+    retries: int = 3,
+    timeout: float = 10.0,
+) -> Optional[Dict[str, Any]]:
+    """
+    GET /v3/snapshot/options/{UNDERLYING}
+    Returns JSON dict or None on failure.
+
+    IMPORTANT:
+      - Underlying symbol only, e.g., 'AAPL' (NO 'O:' prefix here).
+      - Params: limit (<=1000), optional order/sort (not used here).
+    """
+    url = f"{BASE}/v3/snapshot/options/{underlying}"
+    params = {"limit": str(limit), "apiKey": API_KEY}
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                # rate limit: short backoff
+                time.sleep(min(2 * attempt, 10))
+                continue
+            if r.status_code >= 400:
+                # show server message to pinpoint why it's a 400
+                try:
+                    msg = r.json()
+                except Exception:
+                    msg = r.text
+                raise requests.HTTPError(f"{r.status_code} {r.reason}: {msg}", response=r)
+            return r.json()
+        except requests.HTTPError as e:
+            sys.stderr.write(f"WARN: snapshot fetch failed for {underlying}: {e}\n")
+            # Don't retry 4xx except 429
+            code = getattr(e.response, "status_code", None)
+            if code and 400 <= code < 500 and code != 429:
+                return None
+        except Exception as e:
+            sys.stderr.write(f"WARN: network error for {underlying}: {e}\n")
+            time.sleep(min(2 * attempt, 10))
+    return None
+
+
+# ----------------------- Row building / filters -----------------------
+
+def _safe_get(d: Dict[str, Any], *keys: str, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _mid(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+    try:
+        if bid is None or ask is None:
             return None
-        if isinstance(x, (int, float)):
-            return float(x)
-        s = str(x).strip()
-        if s == "" or s.lower() in {"nan", "na", "null"}:
+        if bid <= 0 or ask <= 0:
             return None
-        return float(s)
+        return (bid + ask) / 2.0
     except Exception:
         return None
 
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-def day_str_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-def ensure_dir(p: str) -> None:
-    os.makedirs(p, exist_ok=True)
-
-def http_get(url: str, params: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
+def _parse_iso_to_date(s: Optional[str]) -> Optional[date]:
+    if not s:
+        return None
     try:
-        return r.json()
-    except json.JSONDecodeError:
-        return {}
-
-# ------------------------- data sources ------------------------
-
-def load_tickers() -> List[str]:
-    """Prefer repo config.TICKERS; otherwise fallback set."""
-    try:
-        # If your repo already has Grond-main/config.py with TICKERS, this picks it up.
-        from config import TICKERS  # type: ignore
-        ts = [t.strip().upper() for t in TICKERS if t and isinstance(t, str)]
-        if ts:
-            return ts
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
     except Exception:
-        pass
-    # Fallback mega-caps (covers common testing)
-    return ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOG", "TSLA"]
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
 
-def fetch_underlying_price(symbol: str, api_key: str) -> Optional[float]:
-    """
-    Equity last trade price. We prefer /v2/last/trade/{ticker}.
-    """
-    url = f"{API_BASE}/v2/last/trade/{symbol}"
-    data = http_get(url, {"apiKey": api_key})
-    p = (
-        data.get("results", {}).get("p")  # price
-        if isinstance(data.get("results"), dict)
-        else None
-    )
-    return robust_float(p)
 
-def fetch_option_snapshots(symbol: str, api_key: str, limit: int = 1000) -> List[Dict[str, Any]]:
-    """
-    Polygon v3 snapshot for all options on an underlying.
-    Endpoint variant used: /v3/snapshot/options/{underlying}
-    """
-    url = f"{API_BASE}/v3/snapshot/options/{symbol}"
-    out: List[Dict[str, Any]] = []
-    params = {"limit": min(limit, 1000), "apiKey": api_key}
-    data = http_get(url, params)
-    results = data.get("results", [])
-    if isinstance(results, list):
-        out.extend(results)
-    return out
+def _days_between(d1: Optional[date], d2: Optional[date]) -> Optional[float]:
+    if not d1 or not d2:
+        return None
+    return float((d2 - d1).days)
 
-# ------------------------- filtering ---------------------------
 
 @dataclass
-class ParsedContract:
-    underlying: str
+class SnapshotRow:
+    symbol: str
     underlying_price: Optional[float]
     contract_symbol: str
-    contract_type: str  # "call"/"put"
+    contract_type: str  # "call" | "put"
     strike: Optional[float]
     expiration_date: Optional[str]
     exercise_style: Optional[str]
@@ -129,7 +166,7 @@ class ParsedContract:
     mid: Optional[float]
     last_price: Optional[float]
     last_size: Optional[float]
-    iv: Optional[float]
+    implied_volatility: Optional[float]
     delta: Optional[float]
     gamma: Optional[float]
     theta: Optional[float]
@@ -139,198 +176,313 @@ class ParsedContract:
     volume: Optional[float]
     updated_at: Optional[str]
     source: str
-    underlying_change_pct: Optional[float]
     moneyness_abs: Optional[float]
-    dte_days: Optional[float]
+    distance_to_expiry_days: Optional[float]
 
-def parse_snapshot_row(row: Dict[str, Any], und_symbol: str, und_price: Optional[float]) -> Optional[ParsedContract]:
-    try:
-        details = row.get("details", {}) if isinstance(row.get("details"), dict) else {}
-        last_quote = row.get("last_quote", {}) if isinstance(row.get("last_quote"), dict) else {}
-        day = row.get("day", {}) if isinstance(row.get("day"), dict) else {}
-        greeks = row.get("greeks", {}) if isinstance(row.get("greeks"), dict) else {}
+    def to_list(self) -> List[Any]:
+        return [
+            self.symbol,
+            self.underlying_price,
+            self.contract_symbol,
+            self.contract_type,
+            self.strike,
+            self.expiration_date,
+            self.exercise_style,
+            self.bid,
+            self.ask,
+            self.mid,
+            self.last_price,
+            self.last_size,
+            self.implied_volatility,
+            self.delta,
+            self.gamma,
+            self.theta,
+            self.vega,
+            self.rho,
+            self.open_interest,
+            self.volume,
+            self.updated_at,
+            self.source,
+            self.moneyness_abs,
+            self.distance_to_expiry_days,
+        ]
 
-        contract_symbol = details.get("ticker") or details.get("symbol") or ""
-        if not contract_symbol:
-            return None
 
-        # Contract meta
-        contract_type = (details.get("contract_type") or "").lower() or ("call" if "C" in contract_symbol else "put")
-        strike = robust_float(details.get("strike_price") or details.get("strike"))
-        expiration_date = details.get("expiration_date") or details.get("expiration")  # YYYY-MM-DD
-        exercise_style = details.get("exercise_style")
-
-        # Quotes / prices
-        bid = robust_float(last_quote.get("bid") or last_quote.get("p"))  # p sometimes bid
-        ask = robust_float(last_quote.get("ask") or last_quote.get("P"))  # P sometimes ask
-        mid = None
-        if bid is not None and ask is not None and ask >= bid:
-            mid = (bid + ask) / 2.0
-
-        last_trade = row.get("last_trade", {})
-        last_price = robust_float(last_trade.get("price") or last_quote.get("bid") or last_quote.get("ask"))
-        last_size = robust_float(last_trade.get("size"))
-
-        # Activity
-        open_interest = robust_float(day.get("open_interest"))
-        volume = robust_float(day.get("volume"))
-
-        # Greeks / IV (may be missing or null)
-        iv = robust_float(row.get("implied_volatility") or greeks.get("iv"))
-        delta = robust_float(greeks.get("delta"))
-        gamma = robust_float(greeks.get("gamma"))
-        theta = robust_float(greeks.get("theta"))
-        vega = robust_float(greeks.get("vega"))
-        rho = robust_float(greeks.get("rho"))
-
-        # Updated time
-        ts = row.get("updated") or row.get("updated_at")
-        if ts and isinstance(ts, (int, float)):
-            updated_at = datetime.fromtimestamp(float(ts) / 1000.0, tz=timezone.utc).isoformat()
-        else:
-            updated_at = ts if isinstance(ts, str) else None
-
-        # Derived
-        up = robust_float(und_price)
-        mny = None
-        if up is not None and strike is not None and up > 0:
-            mny = abs(strike - up) / up
-
-        # Distance to expiry (approx)
-        dte = None
-        if expiration_date:
-            try:
-                dt = datetime.strptime(expiration_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                dte = (dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
-            except Exception:
-                pass
-
-        return ParsedContract(
-            underlying=und_symbol,
-            underlying_price=up,
-            contract_symbol=contract_symbol,
-            contract_type=contract_type,
-            strike=strike,
-            expiration_date=expiration_date,
-            exercise_style=exercise_style,
-            bid=bid,
-            ask=ask,
-            mid=mid,
-            last_price=last_price,
-            last_size=last_size,
-            iv=iv,
-            delta=delta, gamma=gamma, theta=theta, vega=vega, rho=rho,
-            open_interest=open_interest, volume=volume,
-            updated_at=updated_at,
-            source="polygon",
-            underlying_change_pct=None,  # set by caller if desired
-            moneyness_abs=mny,
-            dte_days=dte,
-        )
-    except Exception:
-        return None
-
-def select_near_atm_near_expiry(rows: List[ParsedContract], atm_pct: float, max_expiries: int) -> List[ParsedContract]:
-    """Keep contracts with |moneyness| <= atm_pct, across the nearest distinct expiries (max_expiries)."""
-    # Filter to near-ATM
-    f = [r for r in rows if r.moneyness_abs is not None and r.moneyness_abs <= atm_pct]
-    if not f:
-        return []
-    # Group by expiry, sort by expiry ascending by DTE (closest first)
-    f.sort(key=lambda r: (r.dte_days if r.dte_days is not None else 1e9, r.moneyness_abs))
-    # Keep up to N distinct expiries
-    out: List[ParsedContract] = []
-    seen_exp: List[str] = []
-    for r in f:
-        exp = r.expiration_date or "UNKNOWN"
-        if exp not in seen_exp:
-            seen_exp.append(exp)
-        if exp in seen_exp[:max_expiries]:
-            out.append(r)
-        if len(seen_exp) >= max_expiries and len(out) > 5000:
-            break
-    return out
-
-# --------------------------- writer ----------------------------
-
-CSV_HEADER: List[str] = [
-    "symbol", "underlying_price", "contract_symbol", "contract_type", "strike", "expiration_date", "exercise_style",
-    "bid", "ask", "mid", "last_price", "last_size", "implied_volatility",
-    "delta", "gamma", "theta", "vega", "rho",
-    "open_interest", "volume",
-    "updated_at", "source", "underlying_change_pct", "moneyness_abs", "distance_to_expiry_days",
+HEADER = [
+    "symbol",
+    "underlying_price",
+    "contract_symbol",
+    "contract_type",
+    "strike",
+    "expiration_date",
+    "exercise_style",
+    "bid",
+    "ask",
+    "mid",
+    "last_price",
+    "last_size",
+    "implied_volatility",
+    "delta",
+    "gamma",
+    "theta",
+    "vega",
+    "rho",
+    "open_interest",
+    "volume",
+    "updated_at",
+    "source",
+    "moneyness_abs",
+    "distance_to_expiry_days",
 ]
 
-def row_to_list(p: ParsedContract) -> List[Any]:
-    return [
-        p.underlying, p.underlying_price, p.contract_symbol, p.contract_type, p.strike, p.expiration_date, p.exercise_style,
-        p.bid, p.ask, p.mid, p.last_price, p.last_size, p.iv,
-        p.delta, p.gamma, p.theta, p.vega, p.rho,
-        p.open_interest, p.volume,
-        p.updated_at, p.source, p.underlying_change_pct, p.moneyness_abs, p.dte_days,
-    ]
 
-def write_snapshot_csv(out_dir: str, symbol: str, rows: List[ParsedContract]) -> str:
-    day_dir = os.path.join(out_dir, symbol, day_str_utc())
-    ensure_dir(day_dir)
-    path = os.path.join(day_dir, f"snapshot_{now_utc_iso()}.csv")
+def flatten_snapshot_json(symbol: str, data: Dict[str, Any]) -> Tuple[float, List[SnapshotRow]]:
+    """
+    Returns (underlying_price, rows[])
+    """
+    results = data.get("results") or []
+    # Polygon schema (as of 2025): top-level may include 'underlying_asset' info on each result.
+    rows: List[SnapshotRow] = []
+
+    # underlying price: prefer 'underlying_price' from each option's 'underlying_asset', else None
+    u_prices = []
+    for r in results:
+        p = _safe_get(r, "underlying_asset", "price")
+        if isinstance(p, (int, float)):
+            u_prices.append(float(p))
+    underlying_price = float(sum(u_prices) / len(u_prices)) if u_prices else float("nan")
+
+    # Build rows
+    today = datetime.now(timezone.utc).date()
+    for r in results:
+        opt = r.get("option") or {}
+        # NBBO
+        nbbo = r.get("nbbo") or {}
+        bid = _safe_get(nbbo, "bid", "price"); ask = _safe_get(nbbo, "ask", "price")
+        last = r.get("last_trade") or {}
+        last_price = _safe_get(last, "price")
+        last_size = _safe_get(last, "size")
+
+        # Greeks & IV (may be missing/None)
+        greeks = r.get("greeks") or {}
+        iv = greeks.get("implied_volatility")
+        delta = greeks.get("delta"); gamma = greeks.get("gamma")
+        theta = greeks.get("theta"); vega = greeks.get("vega"); rho = greeks.get("rho")
+
+        # OI/Vol (may be missing)
+        oi = _safe_get(r, "open_interest"); vol = _safe_get(r, "volume")
+
+        # Option meta
+        contract_symbol = opt.get("symbol") or r.get("symbol") or ""
+        contract_type = (opt.get("type") or "").lower()  # "call"/"put"
+        strike = opt.get("strike_price") or opt.get("strike")
+        expiry = opt.get("expiration_date") or opt.get("exp_date")
+        exercise = opt.get("exercise_style")
+
+        # Timestamps
+        updated_at = r.get("updated") or r.get("updated_at")
+
+        # Deriveds
+        try:
+            u = underlying_price
+            m_abs = abs(float(strike) / float(u) - 1.0) if (strike is not None and math.isfinite(u)) else None
+        except Exception:
+            m_abs = None
+        dte = _days_between(today, _parse_iso_to_date(expiry))
+
+        row = SnapshotRow(
+            symbol=symbol,
+            underlying_price=underlying_price if math.isfinite(underlying_price) else None,
+            contract_symbol=contract_symbol,
+            contract_type=contract_type,
+            strike=float(strike) if strike is not None else None,
+            expiration_date=str(expiry) if expiry else None,
+            exercise_style=str(exercise) if exercise else None,
+            bid=float(bid) if bid is not None else None,
+            ask=float(ask) if ask is not None else None,
+            mid=_mid(bid, ask),
+            last_price=float(last_price) if last_price is not None else None,
+            last_size=float(last_size) if last_size is not None else None,
+            implied_volatility=float(iv) if iv is not None else None,
+            delta=float(delta) if delta is not None else None,
+            gamma=float(gamma) if gamma is not None else None,
+            theta=float(theta) if theta is not None else None,
+            vega=float(vega) if vega is not None else None,
+            rho=float(rho) if rho is not None else None,
+            open_interest=float(oi) if oi is not None else None,
+            volume=float(vol) if vol is not None else None,
+            updated_at=str(updated_at) if updated_at else None,
+            source="polygon",
+            moneyness_abs=m_abs,
+            distance_to_expiry_days=dte,
+        )
+        rows.append(row)
+
+    return underlying_price, rows
+
+
+def filter_near_atm_and_top_expiries(
+    rows: List[SnapshotRow],
+    *,
+    near_atm_pct: float,
+    max_expiries: int,
+) -> List[SnapshotRow]:
+    """
+    Keep contracts where abs(moneyness) <= near_atm_pct,
+    then keep only the N nearest expiries by absolute DTE (>=0).
+    """
+    if not rows:
+        return []
+
+    filt = [r for r in rows if (r.moneyness_abs is not None and r.moneyness_abs <= near_atm_pct)]
+    if not filt:
+        return []
+
+    # Group by expiry date
+    by_exp: Dict[str, List[SnapshotRow]] = {}
+    for r in filt:
+        key = r.expiration_date or "NA"
+        by_exp.setdefault(key, []).append(r)
+
+    # Sort expiries by abs(DTE) then take top N
+    def dte_key(k: str) -> float:
+        ds = [rr.distance_to_expiry_days for rr in by_exp[k] if rr.distance_to_expiry_days is not None]
+        return abs(min(ds) if ds else 1e9)
+
+    top_keys = sorted(by_exp.keys(), key=dte_key)[: max(1, max_expiries)]
+    out: List[SnapshotRow] = []
+    for k in top_keys:
+        out.extend(by_exp[k])
+    return out
+
+
+# ----------------------- IO -----------------------
+
+def write_csv(out_dir: str, symbol: str, rows: List[SnapshotRow]) -> Optional[str]:
+    """
+    Write rows to {out_dir}/{symbol}/{YYYY-MM-DD}/snapshot_{ISO}.csv
+    Returns file path or None if nothing written.
+    """
+    # Even if empty, we still write a zero-row CSV (with header) so the workflow can see a file.
+    ts = datetime.now(timezone.utc)
+    dpart = ts.strftime("%Y-%m-%d")
+    isopart = ts.strftime("%Y%m%dT%H%M%SZ")
+    dest_dir = os.path.join(out_dir, symbol, dpart)
+    os.makedirs(dest_dir, exist_ok=True)
+    path = os.path.join(dest_dir, f"snapshot_{isopart}.csv")
+
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(CSV_HEADER)
+        w.writerow(HEADER)
         for r in rows:
-            w.writerow(row_to_list(r))
+            w.writerow(r.to_list())
+
     return path
 
-# --------------------------- main ------------------------------
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Log Polygon option snapshots to CSV.")
-    ap.add_argument("--out", dest="out_dir", required=True, help="Output root directory.")
-    ap.add_argument("--poll", dest="poll_seconds", type=int, default=15, help="Polling seconds (ignored here; handled by workflow loop).")
-    ap.add_argument("--atm", dest="near_atm_pct", type=float, default=0.05, help="Near-ATM band as fraction (0.05 = 5%%).")
-    ap.add_argument("--exp", dest="max_expiries", type=int, default=4, help="Nearest expiries to keep.")
-    args = ap.parse_args()
+# ----------------------- Main -----------------------
 
-    api_key = os.getenv("POLYGON_API_KEY", "")
-    if not api_key:
-        print("ERROR: POLYGON_API_KEY is not set.", file=sys.stderr)
-        return 2
-
-    ensure_dir(args.out_dir)
-
-    tickers = load_tickers()
-    if not tickers:
-        print("ERROR: no tickers.", file=sys.stderr)
-        return 3
-
-    for sym in tickers:
-        try:
-            und_price = fetch_underlying_price(sym, api_key)
-        except Exception as e:
-            print(f"WARN: failed underlying price for {sym}: {e}", file=sys.stderr)
-            und_price = None
-
-        try:
-            snaps = fetch_option_snapshots(sym, api_key, limit=1000)
-        except Exception as e:
-            print(f"WARN: snapshot fetch failed for {sym}: {e}", file=sys.stderr)
-            snaps = []
-
-        parsed: List[ParsedContract] = []
-        for row in snaps:
-            p = parse_snapshot_row(row, sym, und_price)
-            if p:
-                parsed.append(p)
-
-        selected = select_near_atm_near_expiry(parsed, args.near_atm_pct, args.max_expiries)
-        if not selected:
-            print(f"INFO: no near-ATM rows for {sym} (und_price={und_price})")
+def run_once(
+    *,
+    out_dir: str,
+    symbols: Iterable[str],
+    near_atm_pct: float,
+    max_expiries: int,
+) -> List[str]:
+    """
+    One polling pass over all underlyings.
+    Returns list of CSV paths written.
+    """
+    written: List[str] = []
+    for sym in symbols:
+        sym = sym.strip().upper()
+        if not sym:
             continue
 
-        path = write_snapshot_csv(args.out_dir, sym, selected)
-        print(f"OK: wrote {len(selected)} rows for {sym} -> {path}")
+        data = fetch_underlying_snapshot(sym, limit=1000)
+        if not data:
+            sys.stdout.write(f"WARN: no snapshot JSON for {sym}\n")
+            # still write an empty CSV to make the run observable
+            p = write_csv(out_dir, sym, [])
+            if p:
+                written.append(p)
+            continue
 
-    return 0
+        try:
+            u_px, rows = flatten_snapshot_json(sym, data)
+        except Exception as e:
+            sys.stdout.write(f"WARN: failed to parse snapshot for {sym}: {e}\n")
+            p = write_csv(out_dir, sym, [])
+            if p:
+                written.append(p)
+            continue
+
+        if not rows:
+            sys.stdout.write(f"INFO: zero rows in snapshot for {sym}\n")
+            p = write_csv(out_dir, sym, [])
+            if p:
+                written.append(p)
+            continue
+
+        # Filter
+        filtered = filter_near_atm_and_top_expiries(rows, near_atm_pct=near_atm_pct, max_expiries=max_expiries)
+        if not filtered:
+            sys.stdout.write(f"INFO: no near-ATM rows for {sym} (und_price={u_px})\n")
+            p = write_csv(out_dir, sym, [])
+            if p:
+                written.append(p)
+            continue
+
+        p = write_csv(out_dir, sym, filtered)
+        if p:
+            written.append(p)
+            sys.stdout.write(f"INFO: wrote {len(filtered)} rows for {sym} -> {p}\n")
+
+    return written
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Log Polygon option snapshots to CSV.")
+    ap.add_argument("--out", required=True, help="Output directory (created if missing).")
+    ap.add_argument("--poll", type=int, default=15, help="Poll interval seconds (used by the caller loop).")
+    ap.add_argument("--atm", type=float, default=0.05, help="Near-ATM band: abs(strike/underlying-1) <= atm.")
+    ap.add_argument("--exp", type=int, default=4, help="Keep N nearest expiries.")
+    ap.add_argument(
+        "--tickers",
+        type=str,
+        default=",".join(TICKERS),
+        help="Comma-separated list of underlyings. Defaults to repo config or a mega-cap set.",
+    )
+    return ap.parse_args()
+
+
+def main() -> None:
+    ns = parse_args()
+    out_dir = ns.out
+    near_atm_pct = float(ns.atm)
+    max_expiries = int(ns.exp)
+    tickers = [t.strip().upper() for t in ns.tickers.split(",") if t.strip()]
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    written = run_once(
+        out_dir=out_dir,
+        symbols=tickers,
+        near_atm_pct=near_atm_pct,
+        max_expiries=max_expiries,
+    )
+
+    # Simple summary to stdout (GH logs)
+    total_rows = 0
+    for p in written:
+        try:
+            with open(p, "r") as f:
+                n = sum(1 for _ in f) - 1  # minus header
+                total_rows += max(0, n)
+        except Exception:
+            pass
+    sys.stdout.write(f"SUMMARY: files={len(written)} total_rows={total_rows}\n")
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
